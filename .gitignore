@@ -1,5 +1,9 @@
 # 機密情報
 config.json
+config_local.json
+
+# main.pyを除外（統合版のみ公開）
+main.py
 
 # ログファイル
 logs/
@@ -13,6 +17,7 @@ daily_results/
 trades.csv
 # サンプルファイルは含める
 !trades_example.csv
+!config_example.json
 
 # Python
 __pycache__/
@@ -133,7 +138,6 @@ Desktop.ini
 # 一時ファイル
 *.tmp
 *.temp GitInstaller.exe
-
 
 # Claude Flow generated files
 .claude/settings.local.json
