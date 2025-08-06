@@ -14,10 +14,7 @@ For more information, see README.md
 
 import os
 import csv
-import requests
 import json
-import hmac
-import hashlib
 import time
 import threading
 import logging
@@ -39,6 +36,10 @@ import gc
 # 新しい時刻判定ロジックをインポート
 from trading_time import TradeSchedule, SystemClock, JST
 
+# OANDA APIインポート
+import oandapyV20
+from oandapyV20.endpoints import accounts, orders, pricing, positions
+
 # ===============================
 # グローバル変数
 # ===============================
@@ -52,20 +53,13 @@ performance_metrics = {
     'start_time': datetime.now()
 }
 
-# レート制限管理
-rate_limit_data = {
+# OANDAレート制限管理（120回/分）
+oanda_rate_limit = {
     'last_request_time': 0,
     'request_count': 0,
-    'window_start': time.time()
+    'window_start': time.time(),
+    'max_requests_per_minute': 120
 }
-
-# レート制限用のロック
-post_lock = Lock()
-get_lock = Lock()
-last_post_time = 0
-last_get_time = 0
-current_rate_limit = 20  # 初期値: 20回/秒
-rate_limit_errors = 0
 
 # 設定ファイル管理
 CONFIG_FILE = os.environ.get('CONFIG_FILE', 'config.json')
@@ -90,10 +84,14 @@ def load_config():
                 config = json.load(f)
                 
                 # 環境変数からの設定読み込み（優先度: 環境変数 > 設定ファイル）
-                config['api_key'] = os.environ.get('GMO_API_KEY') or config.get('api_key', '')
-                config['api_secret'] = os.environ.get('GMO_API_SECRET') or config.get('api_secret', '')
                 config['discord_webhook_url'] = os.environ.get('DISCORD_WEBHOOK_GMO') or config.get('discord_webhook_url', '')
                 config['discord_bot_token'] = os.environ.get('DISCORD_BOT_TOKEN') or config.get('discord_bot_token', '')
+                
+                # OANDA設定の環境変数読み込み
+                config['oanda_account_id'] = os.environ.get('OANDA_ACCOUNT_ID') or config.get('oanda_account_id', '')
+                config['oanda_access_token'] = os.environ.get('OANDA_ACCESS_TOKEN') or config.get('oanda_access_token', '')
+                config['oanda_environment'] = os.environ.get('OANDA_ENVIRONMENT') or config.get('oanda_environment', 'practice')
+                config['broker_type'] = os.environ.get('BROKER_TYPE') or config.get('broker_type', 'oanda')
                 
                 return config
         except Exception as e:
@@ -116,7 +114,7 @@ def validate_config(config):
     errors = []
     
     # 必須項目のチェック
-    required_fields = ['api_key', 'api_secret', 'discord_webhook_url']
+    required_fields = ['discord_webhook_url']
     for field in required_fields:
         if not config.get(field):
             errors.append(f"必須項目 '{field}' が設定されていません")
@@ -161,6 +159,16 @@ def validate_config(config):
     autolot_value = config.get('autolot')
     if autolot_value is not None and str(autolot_value).upper() not in ['TRUE', 'FALSE']:
         errors.append("'autolot' は 'TRUE' または 'FALSE' である必要があります")
+    
+    # OANDA設定の検証
+    if not config.get('oanda_account_id'):
+        errors.append("'oanda_account_id' が設定されていません")
+    if not config.get('oanda_access_token'):
+        errors.append("'oanda_access_token' が設定されていません")
+    
+    oanda_env = config.get('oanda_environment', 'practice')
+    if oanda_env not in ['practice', 'live']:
+        errors.append("'oanda_environment' は 'practice' または 'live' である必要があります")
     
     if errors:
         print("設定ファイルにエラーがあります:")
@@ -218,8 +226,6 @@ def reload_config():
 def create_default_config():
     """デフォルト設定ファイルを作成"""
     default_config = {
-        "api_key": "",
-        "api_secret": "",
         "discord_webhook_url": "",
         "spread_threshold": 0.01,
         "jitter_seconds": 5,
@@ -235,7 +241,11 @@ def create_default_config():
         "risk_ratio": 0.02,
         "autolot": "TRUE",
         "auto_restart_hour": 6,
-        "symbol_daily_volume_limit": 15000000  # 銘柄別の一日の最大取引数量（1500万ロット）
+        "symbol_daily_volume_limit": 15000000,  # 銘柄別の一日の最大取引数量（1500万ロット）
+        "broker_type": "oanda",
+        "oanda_account_id": "",
+        "oanda_access_token": "",
+        "oanda_environment": "practice"
     }
     
     if save_config(default_config):
@@ -260,10 +270,15 @@ if not validate_config(config):
     sys.exit(1)
 
 # 設定値の取得
-GMO_API_KEY = config.get('api_key')
-GMO_API_SECRET = config.get('api_secret')
 DISCORD_WEBHOOK_URL = config.get('discord_webhook_url')
-BASE_URL = 'https://forex-api.coin.z.com/private'
+
+# OANDA設定
+OANDA_ACCOUNT_ID = config.get('oanda_account_id')
+OANDA_ACCESS_TOKEN = config.get('oanda_access_token')
+OANDA_ENV = config.get('oanda_environment', 'practice')
+
+# ブローカー選択
+BROKER_TYPE = config.get('broker_type', 'oanda')  # デフォルトをOANDAに変更
 
 # 取引設定
 SPREAD_THRESHOLD = config.get('spread_threshold', 0.01)   # 許容スプレッド（例: 0.01=1pip, USD/JPY想定）
@@ -298,6 +313,133 @@ if DISCORD_WEBHOOK_URL:
 # API呼び出し回数を削減するキャッシュ機構
 ticker_cache = {}
 CACHE_TTL = 5  # 5秒キャッシュ保持
+
+# OANDAブローカー初期化
+logging.info(f"OANDAブローカーを初期化しました: {OANDA_ENV}")
+
+# OANDA API初期化
+oanda_api = oandapyV20.API(
+    access_token=OANDA_ACCESS_TOKEN,
+    environment=OANDA_ENV
+)
+
+# ===============================
+# OANDA用関数（直接コピペ）
+# ===============================
+def get_tickers(symbols):
+    # OANDAレート制限チェック
+    oanda_rate_limit()
+    
+    # symbol表記をOANDA形式に変換（USDJPY → USD_JPY）
+    oanda_symbols = []
+    for symbol in symbols:
+        if len(symbol) == 6 and not "_" in symbol:  # USDJPY形式
+            oanda_symbol = f"{symbol[:3]}_{symbol[3:]}"
+        else:
+            oanda_symbol = symbol
+        oanda_symbols.append(oanda_symbol)
+    
+    instruments = ",".join(oanda_symbols)
+    r = pricing.PricingInfo(accountID=OANDA_ACCOUNT_ID, params={"instruments": instruments})
+    resp = oanda_api.request(r)
+    # OANDAの"bids"/"asks"形式をGMO風の'data'配列に合わせてパース
+    data = []
+    for p in resp["prices"]:
+        data.append({
+            "symbol": p["instrument"],
+            "bid": float(p["bids"][0]["price"]),
+            "ask": float(p["asks"][0]["price"])
+        })
+    return {"data": data}
+
+def get_fx_balance():
+    # OANDAレート制限チェック
+    oanda_rate_limit()
+    
+    r = accounts.AccountDetails(OANDA_ACCOUNT_ID)
+    resp = oanda_api.request(r)
+    balance = float(resp["account"]["NAV"])
+    return {"data": [{"availableAmount": balance}]}
+
+def send_order(symbol, side, size, leverage=None):
+    # OANDAレート制限チェック
+    oanda_rate_limit()
+    
+    # symbol表記をOANDA形式に変換（USDJPY → USD_JPY）
+    if len(symbol) == 6 and not "_" in symbol:  # USDJPY形式
+        oanda_symbol = f"{symbol[:3]}_{symbol[3:]}"
+    else:
+        oanda_symbol = symbol
+    
+    units = int(size) if side == "BUY" else -int(size)
+    data = {
+        "order": {
+            "instrument": oanda_symbol,
+            "units": str(units),
+            "type": "MARKET",
+            "timeInForce": "FOK",
+            "positionFill": "DEFAULT"
+        }
+    }
+    r = orders.OrderCreate(OANDA_ACCOUNT_ID, data=data)
+    resp = oanda_api.request(r)
+    # 必要に応じてレスポンスパース
+    order_id = resp["orderFillTransaction"]["id"]
+    return {"data": [{"orderId": order_id}]}, abs(units)
+
+def close_position(symbol, position_id, size, side):
+    # OANDAレート制限チェック
+    oanda_rate_limit()
+    
+    # symbol表記をOANDA形式に変換（USDJPY → USD_JPY）
+    if len(symbol) == 6 and not "_" in symbol:  # USDJPY形式
+        oanda_symbol = f"{symbol[:3]}_{symbol[3:]}"
+    else:
+        oanda_symbol = symbol
+    
+    data = {"longUnits": "ALL", "shortUnits": "ALL"}
+    r = positions.PositionClose(OANDA_ACCOUNT_ID, instrument=oanda_symbol, data=data)
+    resp = oanda_api.request(r)
+    # price取得（なければNoneで返す）
+    try:
+        price = float(resp["orderFillTransaction"]["price"])
+    except:
+        price = None
+    return {"data": {"price": price}}
+
+def check_current_positions(symbol):
+    # OANDAレート制限チェック
+    oanda_rate_limit()
+    
+    # symbol表記をOANDA形式に変換（USDJPY → USD_JPY）
+    if len(symbol) == 6 and not "_" in symbol:  # USDJPY形式
+        oanda_symbol = f"{symbol[:3]}_{symbol[3:]}"
+    else:
+        oanda_symbol = symbol
+    
+    r = positions.OpenPositions(OANDA_ACCOUNT_ID)
+    resp = oanda_api.request(r)
+    out = []
+    for p in resp["positions"]:
+        if p["instrument"] == oanda_symbol:
+            for side in ["long", "short"]:
+                units = float(p[side]["units"])
+                if abs(units) > 0:
+                    out.append({
+                        "symbol": p["instrument"],
+                        "side": "BUY" if side == "long" else "SELL",
+                        "positionId": f"{p['instrument']}-{side}",
+                        "size": abs(units),
+                        "price": float(p[side]["averagePrice"])
+                    })
+    return out
+
+# ブローカーインスタンス作成
+try:
+    broker = initialize_broker()
+except Exception as e:
+    logging.error(f"ブローカー初期化エラー: {e}")
+    sys.exit(1)
 
 # ===============================
 # ロギング設定（詳細版）
@@ -491,112 +633,89 @@ def cleanup_memory():
         logging.error(f"メモリクリーンアップエラー: {e}")
         return None
 
-def rate_limit(method):
-    """APIレート制限管理（詳細版）"""
-    global last_post_time, last_get_time, current_rate_limit, rate_limit_errors
+def oanda_rate_limit():
+    """OANDA APIレート制限管理（120回/分）"""
+    global oanda_rate_limit
     now = time.time()
     
-    with post_lock if method == 'POST' else get_lock:
-        if method == 'POST':
-            wait = 1.0/current_rate_limit - (now - last_post_time)
-            if wait > 0:
-                time.sleep(wait + random.uniform(0, 0.1))  # ジッター追加
-            last_post_time = time.time()
-        elif method == 'GET':
-            wait = 1.0/current_rate_limit - (now - last_get_time)
-            if wait > 0:
-                time.sleep(wait + random.uniform(0, 0.05))  # ジッター追加
-            last_get_time = time.time()
-
-def adjust_rate_limit(error_code):
-    """レートリミットエラーに応じて動的に調整（詳細版）"""
-    global current_rate_limit, rate_limit_errors
+    # 1分間のウィンドウをチェック
+    if now - oanda_rate_limit['window_start'] >= 60:
+        oanda_rate_limit['request_count'] = 0
+        oanda_rate_limit['window_start'] = now
     
-    if error_code == 'ERR-5003':  # レートリミットエラー
-        rate_limit_errors += 1
-        if rate_limit_errors >= 3:
-            old_limit = current_rate_limit
-            current_rate_limit = max(5, current_rate_limit - 5)  # 最低5回/秒まで
-            logging.warning(f"レートリミットを{old_limit}回/秒から{current_rate_limit}回/秒に調整しました")
-            send_discord_message(f"⚠️ レートリミット調整: {old_limit}回/秒 → {current_rate_limit}回/秒")
-            rate_limit_errors = 0
-    elif error_code == 'ERR-5004':  # その他のAPIエラー
-        # 軽微なエラーの場合は少しだけ調整
-        if rate_limit_errors >= 5:
-            old_limit = current_rate_limit
-            current_rate_limit = max(10, current_rate_limit - 2)
-            logging.info(f"軽微なエラーのためレートリミットを{old_limit}回/秒から{current_rate_limit}回/秒に調整しました")
-            rate_limit_errors = 0
-    else:
-        # エラーがなければ徐々に回復
-        if rate_limit_errors > 0:
-            rate_limit_errors = max(0, rate_limit_errors - 1)
-        if current_rate_limit < 20 and rate_limit_errors == 0:
-            old_limit = current_rate_limit
-            current_rate_limit = min(20, current_rate_limit + 1)
-            if old_limit != current_rate_limit:
-                logging.info(f"レートリミットを{old_limit}回/秒から{current_rate_limit}回/秒に回復しました")
+    # レート制限チェック
+    if oanda_rate_limit['request_count'] >= oanda_rate_limit['max_requests_per_minute']:
+        wait_time = 60 - (now - oanda_rate_limit['window_start'])
+        if wait_time > 0:
+            logging.warning(f"OANDAレート制限により{wait_time:.1f}秒待機します")
+            time.sleep(wait_time)
+        oanda_rate_limit['request_count'] = 0
+        oanda_rate_limit['window_start'] = time.time()
+    
+    oanda_rate_limit['request_count'] += 1
+    oanda_rate_limit['last_request_time'] = now
 
-def get_rate_limit_status():
-    """レート制限の現在の状態を取得"""
+def get_oanda_rate_limit_status():
+    """OANDAレート制限の現在の状態を取得"""
     return {
-        'current_limit': current_rate_limit,
-        'error_count': rate_limit_errors,
-        'last_post_time': last_post_time,
-        'last_get_time': last_get_time
+        'requests_this_minute': oanda_rate_limit['request_count'],
+        'max_requests_per_minute': oanda_rate_limit['max_requests_per_minute'],
+        'window_start': oanda_rate_limit['window_start']
     }
 
 # ===============================
 # 基本API関数（元のmain.pyから統合）
 # ===============================
-def generate_timestamp():
-    """GMOコインAPI用のタイムスタンプ（ミリ秒）を生成"""
-    return '{0}000'.format(int(time.time()))
+# GMO固有関数 - ブローカー抽象化により削除
+# def generate_timestamp():
+#     """GMOコインAPI用のタイムスタンプ（ミリ秒）を生成"""
+#     return '{0}000'.format(int(time.time()))
 
-def generate_signature(timestamp, method, path, body=''):
-    """GMOコインAPI用のリクエスト署名を生成"""
-    if not GMO_API_SECRET:
-        raise ValueError("APIシークレットが設定されていません")
-    text = timestamp + method + path + body
-    return hmac.new(GMO_API_SECRET.encode('ascii'), text.encode('ascii'), hashlib.sha256).hexdigest()
+# def generate_signature(timestamp, method, path, body=''):
+#     """GMOコインAPI用のリクエスト署名を生成"""
+#     if not GMO_API_SECRET:
+#         raise ValueError("APIシークレットが設定されていません")
+#     text = timestamp + method + path + body
+#     return hmac.new(GMO_API_SECRET.encode('ascii'), text.encode('ascii'), hashlib.sha256).hexdigest()
 
-def retry_request(method, url, headers, params=None, data=None):
-    """リトライ機能付きAPIリクエスト"""
-    global performance_metrics
-    
-    # API呼び出しカウンター
-    performance_metrics['api_calls'] += 1
-    
-    base_delay = 1
-    max_delay = 60
-    for attempt in range(3):
-        try:
-            rate_limit(method)
-            if method == 'GET':
-                response = requests.get(url, headers=headers, params=params, timeout=15)
-            elif method == 'POST':
-                response = requests.post(url, headers=headers, json=data, timeout=15)
-                
-            response.raise_for_status()
-            res_json = response.json()
-            
-            if res_json.get('status') != 0:
-                error_code = res_json.get('messages', [{}])[0].get('message_code')
-                performance_metrics['api_errors'] += 1
-                adjust_rate_limit(error_code)  # レートリミット調整
-                if error_code == 'ERR-5003':  # レートリミットエラー特定
-                    backoff = min((2 ** attempt) + random.random(), max_delay)
-                    time.sleep(backoff)
-                    continue
-                    
-            return res_json
-            
-        except requests.exceptions.RequestException as e:
-            performance_metrics['api_errors'] += 1
-            sleep_time = min(base_delay * (2 ** attempt) + random.random(), max_delay)
-            time.sleep(sleep_time)
-            
-    raise Exception("Max retries exceeded")
+# GMO固有関数 - ブローカー抽象化により削除
+# def retry_request(method, url, headers, params=None, data=None):
+#     """リトライ機能付きAPIリクエスト"""
+#     global performance_metrics
+#     
+#     # API呼び出しカウンター
+#     performance_metrics['api_calls'] += 1
+#     
+#     base_delay = 1
+#     max_delay = 60
+#     for attempt in range(3):
+#         try:
+#             rate_limit(method)
+#             if method == 'GET':
+#                 response = requests.get(url, headers=headers, params=params, timeout=15)
+#             elif method == 'POST':
+#                 response = requests.post(url, headers=headers, json=data, timeout=15)
+#                 
+#             response.raise_for_status()
+#             res_json = response.json()
+#             
+#             if res_json.get('status') != 0:
+#                 error_code = res_json.get('messages', [{}])[0].get('message_code')
+#                 performance_metrics['api_errors'] += 1
+#                 adjust_rate_limit(error_code)  # レートリミット調整
+#                 if error_code == 'ERR-5003':  # レートリミットエラー特定
+#                     backoff = min((2 ** attempt) + random.random(), max_delay)
+#                     time.sleep(backoff)
+#                     continue
+#                     
+#             return res_json
+#             
+#         except requests.exceptions.RequestException as e:
+#             performance_metrics['api_errors'] += 1
+#             sleep_time = min(base_delay * (2 ** attempt) + random.random(), max_delay)
+#             time.sleep(sleep_time)
+#             
+#     raise Exception("Max retries exceeded")
 
 def send_discord_message(content):
     """Discordにメッセージを送信"""
@@ -607,239 +726,27 @@ def send_discord_message(content):
     except Exception as e:
         logging.error(f"Discord送信エラー: {e}")
 
-def get_fx_balance():
-    """FX口座残高を取得"""
-    try:
-        timestamp = generate_timestamp()
-        method = 'GET'
-        path = '/v1/account/assets'
-        url = 'https://forex-api.coin.z.com/private' + path
-        headers = {
-            "API-KEY": GMO_API_KEY,
-            "API-TIMESTAMP": timestamp,
-            "API-SIGN": generate_signature(timestamp, method, path)
-        }
-        response = retry_request(method, url, headers)
-        
-        # レスポンスの詳細ログ
-        logging.info(f"証拠金取得レスポンス: {response}")
-        
-        if not response:
-            raise ValueError("証拠金取得APIからレスポンスがありません")
-        
-        if 'data' not in response:
-            raise ValueError(f"証拠金取得APIレスポンスに'data'フィールドがありません: {response}")
-        
-        if not response['data']:
-            raise ValueError(f"証拠金取得APIの'data'フィールドが空です: {response}")
-        
-        return response
-    except Exception as e:
-        logging.error(f"残高取得エラー: {e}")
-        return None
+# GMO固有関数 - OANDA用関数に置き換え済み
+# def get_fx_balance():
+#     """FX口座残高を取得（OANDA版）"""
+#     try:
+#         r = accounts.AccountDetails(OANDA_ACCOUNT_ID)
+#         resp = oanda_api.request(r)
+#         balance = float(resp["account"]["NAV"])
+#         return {"data": [{"availableAmount": balance}]}
+#     except Exception as e:
+#         logging.error(f"残高取得エラー: {e}")
+#         return None
 
-def send_order(symbol, side, size=None, leverage=None):
-    """注文を送信（手数料管理と銘柄別取引数量制限付き）"""
-    global total_api_fee, symbol_daily_volume
-    
-    try:
-        # 銘柄別の取引数量制限チェック
-        if size is not None:
-            current_symbol_volume = symbol_daily_volume.get(symbol, 0)
-            if current_symbol_volume + size > SYMBOL_DAILY_VOLUME_LIMIT:
-                error_msg = f"銘柄{symbol}の一日の取引数量制限を超えます: 現在{current_symbol_volume} + 今回{size} > 制限{SYMBOL_DAILY_VOLUME_LIMIT}"
-                logging.error(error_msg)
-                send_discord_message(error_msg)
-                raise ValueError(error_msg)
-        
-        # autolotがTRUEかつsize未指定なら自動計算
-        if AUTOLOT == 'TRUE' and size is None:
-            try:
-                balance_data = get_fx_balance()
-                logging.info(f"証拠金データ取得結果: {balance_data}")
-                
-                if not balance_data:
-                    error_msg = "証拠金残高の取得に失敗しました: レスポンスが空です"
-                    logging.error(error_msg)
-                    send_discord_message(error_msg)
-                    raise Exception(error_msg)
-                
-                if 'data' not in balance_data:
-                    error_msg = f"証拠金残高の取得に失敗しました: 'data'フィールドがありません - {balance_data}"
-                    logging.error(error_msg)
-                    send_discord_message(error_msg)
-                    raise Exception(error_msg)
-                
-                if not balance_data['data']:
-                    error_msg = f"証拠金残高の取得に失敗しました: 'data'フィールドが空です - {balance_data}"
-                    logging.error(error_msg)
-                    send_discord_message(error_msg)
-                    raise Exception(error_msg)
-                
-                # 証拠金データの形式を判定して取得
-                balance = None
-                if isinstance(balance_data['data'], list) and len(balance_data['data']) > 0:
-                    balance_item = balance_data['data'][0]
-                    if 'availableAmount' in balance_item:
-                        balance = float(balance_item['availableAmount'])
-                        logging.info(f"リスト形式から証拠金取得: {balance}")
-                    else:
-                        error_msg = f"証拠金データに'availableAmount'フィールドがありません: {balance_item}"
-                        logging.error(error_msg)
-                        send_discord_message(error_msg)
-                        raise Exception(error_msg)
-                elif isinstance(balance_data['data'], dict):
-                    if 'availableAmount' in balance_data['data']:
-                        balance = float(balance_data['data']['availableAmount'])
-                        logging.info(f"辞書形式から証拠金取得: {balance}")
-                    else:
-                        error_msg = f"証拠金データに'availableAmount'フィールドがありません: {balance_data['data']}"
-                        logging.error(error_msg)
-                        send_discord_message(error_msg)
-                        raise Exception(error_msg)
-                else:
-                    error_msg = f"証拠金データの形式が不正です: {type(balance_data['data'])} - {balance_data['data']}"
-                    logging.error(error_msg)
-                    send_discord_message(error_msg)
-                    raise Exception(error_msg)
-                
-                if balance is None or balance <= 0:
-                    error_msg = f"無効な証拠金残高: {balance}"
-                    logging.error(error_msg)
-                    send_discord_message(error_msg)
-                    raise Exception(error_msg)
-                
-                logging.info(f"自動ロット計算開始: 証拠金={balance}, 通貨ペア={symbol}, 方向={side}, レバレッジ={leverage or LEVERAGE}")
-                size = calc_auto_lot_gmobot2(balance, symbol, side, leverage or LEVERAGE)
-                logging.info(f"自動ロット計算完了: ロット数={size}")
-                # sizeをint化
-                size = int(size)
-                
-                # 自動ロット計算後の銘柄別取引数量制限チェック
-                current_symbol_volume = symbol_daily_volume.get(symbol, 0)
-                if current_symbol_volume + size > SYMBOL_DAILY_VOLUME_LIMIT:
-                    error_msg = f"銘柄{symbol}の一日の取引数量制限を超えます: 現在{current_symbol_volume} + 今回{size} > 制限{SYMBOL_DAILY_VOLUME_LIMIT}"
-                    logging.error(error_msg)
-                    send_discord_message(error_msg)
-                    raise ValueError(error_msg)
-                
-            except Exception as e:
-                error_msg = f"自動ロット計算中にエラーが発生しました: {e}"
-                logging.error(error_msg)
-                send_discord_message(error_msg)
-                raise
+# GMO固有関数 - OANDA用関数に置き換え済み
+# def send_order(symbol, side, size=None, leverage=None):
+#     """注文を送信（OANDA版）"""
+#     # ... 既存のコード ...
 
-        timestamp = generate_timestamp()
-        path = "/v1/order"
-        
-        # sizeをintでAPIに送信
-        if size is not None:
-            body = {"symbol": symbol, "side": side, "size": str(int(size)), "executionType": "MARKET"}
-        else:
-            body = {"symbol": symbol, "side": side, "size": None, "executionType": "MARKET"}
-        
-        if leverage:
-            body["leverage"] = leverage
-        
-        body_str = json.dumps(body)
-        signature = generate_signature(timestamp, "POST", path, body_str)
-        
-        headers = {
-            "API-KEY": GMO_API_KEY,
-            "API-SIGN": signature,
-            "API-TIMESTAMP": timestamp,
-            "Content-Type": "application/json"
-        }
-        
-        response = retry_request("POST", f"{BASE_URL}{path}", headers, data=body_str)
-        
-        # APIレスポンスの検証
-        if not response or not isinstance(response, dict):
-            error_msg = f"無効なAPIレスポンス: {response}"
-            logging.error(error_msg)
-            send_discord_message(error_msg)
-            raise ValueError(error_msg)
-        
-        if 'data' not in response or not response['data']:
-            error_msg = f"APIレスポンスにデータがありません: {response}"
-            logging.error(error_msg)
-            send_discord_message(error_msg)
-            raise ValueError(error_msg)
-        
-        # API手数料の取得（エラーハンドリング強化）
-        try:
-            if len(response['data']) > 0 and 'orderId' in response['data'][0]:
-                order_id = response['data'][0]['orderId']
-                fee = get_execution_fee(order_id)
-                total_api_fee += fee
-                fee_records.append({"date": datetime.now().date(), "fee": fee})
-                logging.info(f"API手数料取得: {fee}円")
-        except Exception as e:
-            logging.error(f"API手数料取得エラー: {e}")
-            # 手数料取得エラーは致命的ではないので続行
-        
-        # 取引成功時に銘柄別の取引数量を更新
-        if size is not None:
-            symbol_daily_volume[symbol] = symbol_daily_volume.get(symbol, 0) + size
-            logging.info(f"銘柄別取引数量更新: {symbol}{symbol_daily_volume[symbol]}/{SYMBOL_DAILY_VOLUME_LIMIT}")
-        
-        # 実際に使用されたロット数も返す
-        return response, size
-        
-    except Exception as e:
-        logging.error(f"注文送信エラー: {e}")
-        raise
-
-def close_position(symbol, position_id, size, side):
-    """ポジションを決済（手数料管理付き）"""
-    global total_api_fee
-    
-    try:
-        timestamp = generate_timestamp()
-        path = "/v1/closeOrder"
-        
-        body = {
-            "symbol": symbol,
-            "side": side,
-            "executionType": "MARKET",
-            "settlePosition": [
-                {
-                    "positionId": position_id,
-                    "size": str(size)
-                }
-            ]
-        }
-        
-        body_str = json.dumps(body)
-        signature = generate_signature(timestamp, "POST", path, body_str)
-        
-        headers = {
-            "API-KEY": GMO_API_KEY,
-            "API-SIGN": signature,
-            "API-TIMESTAMP": timestamp,
-            "Content-Type": "application/json"
-        }
-        
-        response = retry_request("POST", f"{BASE_URL}{path}", headers, data=body_str)
-        
-        if response and 'data' in response and len(response['data']) > 0:
-            order_id = response['data'][0]['orderId']
-            try:
-                # 手数料をAPIから取得して加算
-                fee_val = get_execution_fee(order_id)
-                total_api_fee += fee_val
-                fee_records.append({"date": datetime.now().date(), "fee": fee_val})
-                executed_price = get_execution_price(order_id)
-                return executed_price
-            except Exception as e:
-                logging.error(f"API手数料取得エラー（決済）: {e}")
-                return get_execution_price(order_id)
-        else:
-            raise ValueError("決済注文に失敗しました")
-            
-    except Exception as e:
-        logging.error(f"決済エラー: {e}")
-        raise
+# GMO固有関数 - OANDA用関数に置き換え済み
+# def close_position(symbol, position_id, size, side):
+#     """ポジションを決済（OANDA版）"""
+#     # ... 既存のコード ...
 
 def get_tickers_optimized(symbols):
     """キャッシュ機能付きティッカー取得"""
@@ -857,19 +764,10 @@ def get_tickers_optimized(symbols):
     
     return {s: ticker_cache[s] for s in symbols if s in ticker_cache}
 
-def get_tickers(symbols):
-    """ティッカー情報を取得"""
-    try:
-        timestamp = generate_timestamp()
-        method = 'GET'
-        path = '/v1/ticker'
-        url = 'https://forex-api.coin.z.com/public' + path
-        params = {'symbol': ','.join(symbols)}
-        headers = {"API-TIMESTAMP": timestamp}
-        return retry_request(method, url, headers, params)
-    except Exception as e:
-        logging.error(f"ティッカー取得エラー: {e}")
-        return None
+# GMO固有関数 - OANDA用関数に置き換え済み
+# def get_tickers(symbols):
+#     """ティッカー情報を取得（OANDA版）"""
+#     # ... 既存のコード ...
 
 def format_price(price, symbol):
     """価格をフォーマット"""
@@ -1196,24 +1094,10 @@ def get_position_by_order_id(order_data):
         send_discord_message(f"⚠️ ポジション情報取得エラー: {str(e)}")
         return None
 
-def check_current_positions(symbol):
-    """現在のポジションをチェック"""
-    try:
-        timestamp = generate_timestamp()
-        path = f"/v1/openPositions?symbol={symbol}"
-        signature = generate_signature(timestamp, "GET", path)
-        
-        headers = {
-            "API-KEY": GMO_API_KEY,
-            "API-SIGN": signature,
-            "API-TIMESTAMP": timestamp
-        }
-        
-        response = retry_request("GET", f"{BASE_URL}{path}", headers)
-        return response.get('data', []) if response else []
-    except Exception as e:
-        logging.error(f"ポジションチェックエラー: {e}")
-        return []
+# GMO固有関数 - OANDA用関数に置き換え済み
+# def check_current_positions(symbol):
+#     """現在のポジションをチェック（OANDA版）"""
+#     # ... 既存のコード ...
 
 # ===============================
 # 取引実行関数（元のロジックを統合）
@@ -2364,19 +2248,25 @@ if DISCORD_BOT_TOKEN:
 def get_all_positions():
     """全ポジションを取得"""
     try:
-        timestamp = generate_timestamp()
-        method = 'GET'
-        path = '/v1/openPositions'
-        url = 'https://forex-api.coin.z.com/private' + path
-        headers = {
-            "API-KEY": GMO_API_KEY,
-            "API-TIMESTAMP": timestamp,
-            "API-SIGN": generate_signature(timestamp, method, path)
-        }
-        res = retry_request(method, url, headers)
-        if isinstance(res, dict) and 'data' in res and 'list' in res['data']:
-            return res['data']['list']
-        return []
+        # OANDAレート制限チェック
+        oanda_rate_limit()
+        
+        r = positions.OpenPositions(OANDA_ACCOUNT_ID)
+        resp = oanda_api.request(r)
+        
+        positions_list = []
+        for p in resp["positions"]:
+            for side in ["long", "short"]:
+                units = float(p[side]["units"])
+                if abs(units) > 0:
+                    positions_list.append({
+                        "symbol": p["instrument"],
+                        "side": "BUY" if side == "long" else "SELL",
+                        "positionId": f"{p['instrument']}-{side}",
+                        "size": abs(units),
+                        "price": float(p[side]["averagePrice"])
+                    })
+        return positions_list
     except Exception as e:
         logging.error(f"全ポジション取得エラー: {e}")
         return []

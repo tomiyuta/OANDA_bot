@@ -17,5 +17,9 @@
   "risk_ratio": 1.0,
   "autolot": "TRUE",
   "auto_restart_hour": null,
-  "symbol_daily_volume_limit": 15000000
+  "symbol_daily_volume_limit": 15000000,
+  "broker_type": "gmo",
+  "oanda_account_id": "OANDA-XXXXXX-XXX",
+  "oanda_access_token": "your_oanda_token",
+  "oanda_environment": "practice"
 } 

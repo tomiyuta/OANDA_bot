@@ -1,8 +1,8 @@
-# GMO Coin 自動取引ボット (統合版)
+# OANDA 自動取引ボット (統合版)
 
 ## 概要
 
-GMO Coin 自動取引ボットは、GMO CoinのFX APIを使用した高度な自動取引システムです。Discord連携、リスク管理、詳細なログ機能を備え、24時間無人運転での取引を可能にします。
+OANDA 自動取引ボットは、OANDAのFX APIを使用した高度な自動取引システムです。Discord連携、リスク管理、詳細なログ機能を備え、24時間無人運転での取引を可能にします。
 
 ## 主要機能
 
@@ -17,7 +17,7 @@ GMO Coin 自動取引ボットは、GMO CoinのFX APIを使用した高度な自
 - **ストップロス/テイクプロフィット**: 自動決済機能
 - **銘柄別取引数量制限**: 一日の取引数量上限を設定
 - **重複建玉防止**: 同一方向の重複ポジションを防止
-- **レート制限管理**: API制限に応じた動的な調整
+- **レート制限管理**: OANDA API制限（120回/分）の自動管理
 - **定期ポジション監視**: 指定時間ごとにポジションを監視し、trades.csvの時間外ポジションを自動決済
 
 ### 📊 監視・分析機能
@@ -65,13 +65,13 @@ GMO Coin 自動取引ボットは、GMO CoinのFX APIを使用した高度な自
 
 ### 必要な環境
 - Python 3.8以上
-- GMO Coin APIアカウント
+- OANDA APIアカウント（デモ口座またはライブ口座）
 - Discord Webhook URL（オプション）
 - Discord Bot Token（オプション）
 
 ### 必要なパッケージ
 ```
-requests>=2.25.1
+oandapyV20>=0.7.2
 discord.py>=2.0.0
 psutil>=5.8.0
 ```
@@ -89,13 +89,20 @@ cd gmocoinbot_updated
 pip install -r requirements.txt
 ```
 
-### 3. 設定ファイルの作成
+### 3. OANDAアカウントの準備
+1. [OANDA公式サイト](https://www.oanda.com/)でアカウントを作成
+2. デモ口座またはライブ口座を開設
+3. APIアクセストークンを取得
+4. アカウントIDを確認
+
+### 4. 設定ファイルの作成
 初回実行時に`config.json`が自動生成されます。以下の項目を設定してください：
 
 ```json
 {
-  "api_key": "YOUR_GMO_API_KEY",
-  "api_secret": "YOUR_GMO_API_SECRET",
+  "oanda_account_id": "OANDA-XXXXXX-XXX",
+  "oanda_access_token": "YOUR_OANDA_ACCESS_TOKEN",
+  "oanda_environment": "practice",
   "discord_webhook_url": "YOUR_DISCORD_WEBHOOK_URL",
   "discord_bot_token": "YOUR_DISCORD_BOT_TOKEN",
   "spread_threshold": 0.01,
@@ -116,20 +123,23 @@ pip install -r requirements.txt
 }
 ```
 
-### 4. 取引スケジュールの設定
+### 5. 取引スケジュールの設定
 `trades.csv`ファイルを作成し、取引スケジュールを設定：
 
 ```csv
 取引番号,売買方向,通貨ペア,エントリー時刻,決済時刻,ロット数
-1,買,USD/JPY,09:30:00,10:00:00,
-2,売,EUR/JPY,14:00:00,14:30:00,
-3,買,GBP/JPY,15:30:00,16:00:00,
+1,買,USD_JPY,09:30:00,10:00:00,
+2,売,EUR_JPY,14:00:00,14:30:00,
+3,買,GBP_JPY,15:30:00,16:00:00,
 ```
 
-### 5. 環境変数の設定（オプション）
+**注意**: OANDAでは通貨ペアは`USD_JPY`形式で指定してください。
+
+### 6. 環境変数の設定（オプション）
 ```bash
-export GMO_API_KEY="your_api_key"
-export GMO_API_SECRET="your_api_secret"
+export OANDA_ACCOUNT_ID="OANDA-XXXXXX-XXX"
+export OANDA_ACCESS_TOKEN="your_access_token"
+export OANDA_ENVIRONMENT="practice"
 export DISCORD_WEBHOOK_GMO="your_webhook_url"
 export DISCORD_BOT_TOKEN="your_bot_token"
 export TRADES_CSV="trades.csv"
@@ -156,8 +166,12 @@ python config_editor.py
 
 ## 設定項目詳細
 
-### 基本設定
-- **api_key/api_secret**: GMO Coin API認証情報
+### OANDA設定
+- **oanda_account_id**: OANDAアカウントID（例: OANDA-XXXXXX-XXX）
+- **oanda_access_token**: OANDA APIアクセストークン
+- **oanda_environment**: 環境設定（"practice" または "live"）
+
+### Discord設定
 - **discord_webhook_url**: Discord通知用Webhook URL
 - **discord_bot_token**: Discord Bot用トークン
 
@@ -177,6 +191,24 @@ python config_editor.py
 - **auto_restart_hour**: 自動再起動時刻（0-23、nullで無効）
 - **position_check_interval**: ポジション監視間隔（秒）
 - **position_check_interval_minutes**: 定期監視間隔（分）
+
+## OANDA API仕様
+
+### 認証方式
+- **アクセストークン認証**: HMAC署名不要、トークンのみで認証
+- **アカウントID**: 各APIリクエストにアカウントIDを指定
+
+### レート制限
+- **制限**: 120回/分（1分間に120リクエスト）
+- **自動管理**: システムが自動的にレート制限を管理
+
+### 通貨ペア表記
+- **形式**: `USD_JPY`, `EUR_JPY`, `GBP_JPY`など
+- **自動変換**: `USDJPY`形式は自動的に`USD_JPY`に変換
+
+### 注文単位
+- **units**: 通貨単位での注文（1 lot = 1通貨単位）
+- **方向**: BUY=正数、SELL=負数
 
 ## Discord Bot コマンド
 
@@ -207,6 +239,9 @@ python config_editor.py
 gmocoinbot_updated/
 ├── main_integrated.py      # メイン実行ファイル
 ├── trading_time.py         # 時刻管理モジュール
+├── broker_base.py          # ブローカー抽象化インターフェース
+├── gmo_broker.py           # GMO Coinブローカー実装
+├── oanda_broker.py         # OANDAブローカー実装
 ├── config_editor.py        # 設定エディター
 ├── config_example.json     # 設定ファイルサンプル
 ├── trades_example.csv      # 取引スケジュールサンプル
@@ -239,9 +274,9 @@ gmocoinbot_updated/
 ## セキュリティ
 
 ### API認証
-- HMAC-SHA256署名による認証
-- タイムスタンプベースのリクエスト検証
+- アクセストークンベースの認証
 - 環境変数による機密情報管理
+- アカウントIDによるアクセス制御
 
 ### リスク管理
 - 取引数量制限
@@ -252,18 +287,20 @@ gmocoinbot_updated/
 
 ### ⚠️ セキュリティ注意事項
 - **config.jsonは絶対にGitにコミットしないでください**
-- APIキーは定期的に更新してください
+- アクセストークンは定期的に更新してください
 - 環境変数を使用することを推奨します
 - ログファイルには機密情報が含まれる場合があります
+- デモ口座で十分にテストしてからライブ口座を使用してください
 
 ## トラブルシューティング
 
 ### よくある問題
 
-#### API接続エラー
-- APIキーとシークレットが正しく設定されているか確認
+#### OANDA API接続エラー
+- アカウントIDとアクセストークンが正しく設定されているか確認
 - ネットワーク接続を確認
-- GMO Coin APIの稼働状況を確認
+- OANDA APIの稼働状況を確認
+- デモ/ライブ環境の設定が正しいか確認
 
 #### Discord通知が届かない
 - Webhook URLが正しく設定されているか確認
@@ -272,8 +309,13 @@ gmocoinbot_updated/
 
 #### 取引が実行されない
 - `trades.csv`の形式が正しいか確認
+- 通貨ペア表記が`USD_JPY`形式になっているか確認
 - 時刻設定が正しいか確認
 - スプレッドが閾値を超えていないか確認
+
+#### レート制限エラー
+- 1分間に120回を超えるAPI呼び出しがないか確認
+- システムが自動的にレート制限を管理します
 
 #### メモリ使用量が高い
 - `cleanup`コマンドでメモリクリーンアップを実行
@@ -300,7 +342,7 @@ tail -f logs/main.log
 - 不要なデータの自動削除
 
 ### API最適化
-- レート制限の動的調整
+- OANDAレート制限（120回/分）の自動管理
 - リトライ機能
 - キャッシュ機能
 
@@ -342,8 +384,23 @@ MIT License
 
 ## 更新履歴
 
-### v2.1.0 (最新)
+### v3.0.0 (最新)
+- **OANDA API対応**
+- アクセストークンベース認証
+- OANDAレート制限管理（120回/分）
+- 通貨ペア表記の自動変換
+- ブローカー抽象化レイヤー追加
 - 統合版リリース
+- Discord Bot機能追加
+- 詳細なリスク管理機能
+- パフォーマンス分析機能
+- 自動バックアップ機能
+- メモリ管理機能
+- ヘルスチェック機能
+- **定期ポジション監視機能追加**
+
+### v2.1.0
+- GMO Coin統合版リリース
 - Discord Bot機能追加
 - 詳細なリスク管理機能
 - パフォーマンス分析機能
@@ -368,6 +425,7 @@ MIT License
 - 十分なテストを行ってから本番運用してください
 - 資金管理を適切に行ってください
 - 市場状況に応じて設定を調整してください
+- **デモ口座で十分にテストしてからライブ口座を使用してください**
 
 ### 法的注意
 - 各国の金融規制を遵守してください
@@ -379,4 +437,5 @@ MIT License
 - システム監視を継続してください
 - セキュリティアップデートを適用してください
 - ログファイルを定期的に確認してください
-- **機密情報を含むファイルは絶対にGitにコミットしないでください** 
+- **機密情報を含むファイルは絶対にGitにコミットしないでください**
+- **OANDAの利用規約とAPI制限を遵守してください** 
