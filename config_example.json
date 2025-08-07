@@ -1,7 +1,31 @@
 {
-  "api_key": "YOUR_GMO_API_KEY_HERE",
-  "api_secret": "YOUR_GMO_API_SECRET_HERE",
-  "discord_webhook_url": "YOUR_DISCORD_WEBHOOK_URL_HERE",
+  "brokers": [
+    {
+      "name": "gmo",
+      "type": "gmo",
+      "trade_csv": "trades_gmo.csv",
+      "discord_webhook_url": "YOUR_DISCORD_WEBHOOK_URL_GMO_HERE",
+      "api_key": "YOUR_GMO_API_KEY_HERE",
+      "api_secret": "YOUR_GMO_API_SECRET_HERE",
+      "leverage": 10,
+      "risk_ratio": 1.0,
+      "autolot": "TRUE",
+      "symbol_daily_volume_limit": 15000000
+    },
+    {
+      "name": "oanda",
+      "type": "oanda",
+      "trade_csv": "trades_oanda.csv",
+      "discord_webhook_url": "YOUR_DISCORD_WEBHOOK_URL_OANDA_HERE",
+      "oanda_account_id": "OANDA-XXXXXX-XXX",
+      "oanda_access_token": "your_oanda_token",
+      "oanda_environment": "practice",
+      "leverage": 10,
+      "risk_ratio": 1.0,
+      "autolot": "TRUE",
+      "symbol_daily_volume_limit": 15000000
+    }
+  ],
   "discord_bot_token": "YOUR_DISCORD_BOT_TOKEN_HERE",
   "spread_threshold": 0.01,
   "jitter_seconds": 3,
@@ -13,13 +37,5 @@
   "take_profit_pips": 0,
   "position_check_interval": 5,
   "position_check_interval_minutes": 10,
-  "leverage": 10,
-  "risk_ratio": 1.0,
-  "autolot": "TRUE",
-  "auto_restart_hour": null,
-  "symbol_daily_volume_limit": 15000000,
-  "broker_type": "gmo",
-  "oanda_account_id": "OANDA-XXXXXX-XXX",
-  "oanda_access_token": "your_oanda_token",
-  "oanda_environment": "practice"
+  "auto_restart_hour": null
 } 

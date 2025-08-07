@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
 Broker Base Class for Trading Bot
-Version: 1.0.0
+Version: 2.0.0
 License: MIT License
 Copyright (c) 2024 Trading Bot
 
-Abstract base class for broker implementations.
+Abstract base class for broker implementations with multi-broker support.
 Provides a unified interface for different broker APIs.
 """
 
 from abc import ABC, abstractmethod
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
+from discord import SyncWebhook
+import csv
+import logging
 
 
 @dataclass
@@ -58,7 +61,7 @@ class Ticker:
 
 class BrokerBase(ABC):
     """
-    ブローカー抽象基底クラス
+    ブローカー抽象基底クラス（マルチブローカー対応）
     各ブローカー（GMO Coin、OANDA等）の実装で継承する
     """
     
@@ -69,10 +72,97 @@ class BrokerBase(ABC):
         Args:
             config: ブローカー設定辞書
         """
+        # 基本設定
+        self.name = config.get("name", "unknown")
+        self.type = config.get("type", "unknown")
+        self.trade_csv = config.get("trade_csv", "trades.csv")
+        self.discord_webhook_url = config.get("discord_webhook_url", "")
+        
+        # Discord Webhook初期化
+        if self.discord_webhook_url:
+            try:
+                self.webhook = SyncWebhook.from_url(self.discord_webhook_url)
+            except Exception as e:
+                logging.error(f"[{self.name}] Discord Webhook初期化エラー: {e}")
+                self.webhook = None
+        else:
+            self.webhook = None
+        
+        # ブローカー固有設定
         self.config = config
         self.api_key = config.get('api_key', '')
         self.api_secret = config.get('api_secret', '')
         self.base_url = config.get('base_url', '')
+        
+        # 取引設定
+        self.leverage = config.get('leverage', 10)
+        self.risk_ratio = config.get('risk_ratio', 1.0)
+        self.autolot = config.get('autolot', 'TRUE').upper() == 'TRUE'
+        self.symbol_daily_volume_limit = config.get('symbol_daily_volume_limit', 15000000)
+    
+    def get_trades(self) -> List[List[str]]:
+        """
+        CSVファイルを読み込み、トレードデータを返す
+        
+        Returns:
+            List[List[str]]: トレードデータのリスト
+        """
+        trades = []
+        try:
+            with open(self.trade_csv, encoding="utf-8") as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    if row and row[0].startswith("#"):  # コメント行スキップ
+                        continue
+                    trades.append(row)
+            logging.info(f"[{self.name}] {len(trades)}件のトレードデータを読み込みました")
+        except FileNotFoundError:
+            logging.warning(f"[{self.name}] トレードファイルが見つかりません: {self.trade_csv}")
+        except Exception as e:
+            logging.error(f"[{self.name}] トレードファイル読み込みエラー: {e}")
+        
+        return trades
+    
+    def notify(self, msg: str) -> bool:
+        """
+        Discordに通知を送信
+        
+        Args:
+            msg: 送信メッセージ
+            
+        Returns:
+            bool: 送信成功時はTrue
+        """
+        if not self.webhook:
+            logging.warning(f"[{self.name}] Discord Webhookが設定されていません")
+            return False
+        
+        try:
+            # ブローカー名をプレフィックスとして追加
+            formatted_msg = f"[{self.name}] {msg}"
+            self.webhook.send(formatted_msg)
+            logging.info(f"[{self.name}] Discord通知送信成功: {msg[:50]}...")
+            return True
+        except Exception as e:
+            logging.error(f"[{self.name}] Discord通知エラー: {e}")
+            return False
+    
+    def get_broker_info(self) -> Dict[str, Any]:
+        """
+        ブローカー情報を取得
+        
+        Returns:
+            Dict[str, Any]: ブローカー情報
+        """
+        return {
+            "name": self.name,
+            "type": self.type,
+            "trade_csv": self.trade_csv,
+            "leverage": self.leverage,
+            "risk_ratio": self.risk_ratio,
+            "autolot": self.autolot,
+            "symbol_daily_volume_limit": self.symbol_daily_volume_limit
+        }
     
     @abstractmethod
     def get_balance(self) -> Optional[Balance]:
@@ -286,12 +376,26 @@ class BrokerBase(ABC):
         Returns:
             bool: 妥当な場合はTrue
         """
-        if not self.api_key:
+        if not self.name:
+            logging.error(f"[{self.name}] ブローカー名が設定されていません")
             return False
-        if not self.api_secret:
+        if not self.type:
+            logging.error(f"[{self.name}] ブローカータイプが設定されていません")
             return False
-        if not self.base_url:
+        if not self.trade_csv:
+            logging.error(f"[{self.name}] トレードCSVファイルが設定されていません")
             return False
+        
+        # ブローカータイプ別の検証
+        if self.type == "gmo":
+            if not self.api_key or not self.api_secret:
+                logging.error(f"[{self.name}] GMO API設定が不完全です")
+                return False
+        elif self.type == "oanda":
+            if not self.config.get('oanda_account_id') or not self.config.get('oanda_access_token'):
+                logging.error(f"[{self.name}] OANDA API設定が不完全です")
+                return False
+        
         return True
     
     def get_broker_name(self) -> str:
@@ -301,4 +405,4 @@ class BrokerBase(ABC):
         Returns:
             str: ブローカー名
         """
-        return self.__class__.__name__ 
+        return self.name 
