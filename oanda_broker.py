@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 OANDA Broker Implementation
-Version: 1.0.0
+Version: 2.0.0
 License: MIT License
 Copyright (c) 2024 Trading Bot
 
@@ -33,9 +33,9 @@ class OANDABroker(BrokerBase):
         super().__init__(config)
         
         # OANDA API設定
-        self.account_id = config.get('account_id', '')
-        self.access_token = config.get('access_token', '')
-        self.environment = config.get('environment', 'practice')  # 'practice' or 'live'
+        self.account_id = config.get('oanda_account_id', '')
+        self.access_token = config.get('oanda_access_token', '')
+        self.environment = config.get('oanda_environment', 'practice')  # 'practice' or 'live'
         
         # OANDA APIクライアント初期化
         self.client = oandapyV20.API(
@@ -47,6 +47,121 @@ class OANDABroker(BrokerBase):
         self.last_request_time = 0
         self.request_count = 0
         self.current_rate_limit = 120  # OANDAは120回/分
+    
+    def entry(self, trade: List[str]) -> bool:
+        """
+        OANDAでエントリー注文を実行
+        
+        Args:
+            trade: トレードデータ [date, time, symbol, side, size, entry_time, exit_time]
+            
+        Returns:
+            bool: 成功時はTrue
+        """
+        try:
+            if len(trade) < 5:
+                logging.error(f"[{self.name}] 無効なトレードデータ: {trade}")
+                return False
+            
+            date, time_str, symbol, side, size_str = trade[:5]
+            
+            # サイズを数値に変換
+            try:
+                size = float(size_str) if size_str else None
+            except ValueError:
+                logging.error(f"[{self.name}] 無効なサイズ: {size_str}")
+                return False
+            
+            # エントリー注文実行
+            order = self.create_order(symbol, side, size, self.leverage)
+            
+            if order:
+                # Discord通知
+                msg = f"エントリー注文実行: {symbol} {side} {size}ロット"
+                self.notify(msg)
+                
+                logging.info(f"[{self.name}] エントリー注文成功: {symbol} {side} {size}ロット")
+                return True
+            else:
+                error_msg = f"エントリー注文失敗: {symbol} {side} {size}ロット"
+                self.notify(error_msg)
+                logging.error(f"[{self.name}] {error_msg}")
+                return False
+                
+        except Exception as e:
+            error_msg = f"エントリー処理エラー: {e}"
+            self.notify(error_msg)
+            logging.error(f"[{self.name}] {error_msg}")
+            return False
+    
+    def exit(self, trade: List[str]) -> bool:
+        """
+        OANDAで決済注文を実行
+        
+        Args:
+            trade: トレードデータ [date, time, symbol, side, size, entry_time, exit_time]
+            
+        Returns:
+            bool: 成功時はTrue
+        """
+        try:
+            if len(trade) < 5:
+                logging.error(f"[{self.name}] 無効なトレードデータ: {trade}")
+                return False
+            
+            date, time_str, symbol, side, size_str = trade[:5]
+            
+            # サイズを数値に変換
+            try:
+                size = float(size_str) if size_str else None
+            except ValueError:
+                logging.error(f"[{self.name}] 無効なサイズ: {size_str}")
+                return False
+            
+            # 現在のポジションを取得
+            positions = self.check_current_positions(symbol)
+            
+            if not positions:
+                msg = f"決済対象ポジションなし: {symbol}"
+                self.notify(msg)
+                logging.warning(f"[{self.name}] {msg}")
+                return True  # ポジションがない場合は成功として扱う
+            
+            # 決済方向を決定（エントリーと逆方向）
+            exit_side = "SELL" if side == "BUY" else "BUY"
+            
+            success_count = 0
+            for position in positions:
+                if position.side == side:  # 同じ方向のポジションのみ決済
+                    # 決済注文実行
+                    exit_price = self.close_position(symbol, position.position_id, position.size, exit_side)
+                    
+                    if exit_price:
+                        success_count += 1
+                        # 損益計算
+                        profit_pips = self.calculate_profit_pips(position.price, exit_price, side, symbol)
+                        profit_amount = self.calculate_profit_amount(position.price, exit_price, side, symbol, position.size)
+                        
+                        # Discord通知
+                        msg = f"決済完了: {symbol} {position.size}ロット 損益: {profit_pips}pips (¥{profit_amount})"
+                        self.notify(msg)
+                        
+                        logging.info(f"[{self.name}] 決済成功: {symbol} 損益: {profit_pips}pips (¥{profit_amount})")
+                    else:
+                        error_msg = f"決済失敗: {symbol} {position.size}ロット"
+                        self.notify(error_msg)
+                        logging.error(f"[{self.name}] {error_msg}")
+            
+            if success_count > 0:
+                return True
+            else:
+                return False
+                
+        except Exception as e:
+            error_msg = f"決済処理エラー: {e}"
+            self.notify(error_msg)
+            logging.error(f"[{self.name}] {error_msg}")
+            return False
     
     def get_balance(self) -> Optional[Balance]:
         """口座残高を取得"""
