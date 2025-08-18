@@ -39,6 +39,7 @@ from trading_time import TradeSchedule, SystemClock, JST
 # OANDA APIインポート
 import oandapyV20
 from oandapyV20.endpoints import accounts, orders, pricing, positions
+from oanda_broker import OANDABroker
 
 # ===============================
 # グローバル変数
@@ -54,7 +55,7 @@ performance_metrics = {
 }
 
 # OANDAレート制限管理（120回/分）
-oanda_rate_limit = {
+oanda_rate_limit_state = {
     'last_request_time': 0,
     'request_count': 0,
     'window_start': time.time(),
@@ -85,6 +86,12 @@ def load_config():
                 
                 # 環境変数からの設定読み込み（優先度: 環境変数 > 設定ファイル）
                 config['discord_webhook_url'] = os.environ.get('DISCORD_WEBHOOK_GMO') or config.get('discord_webhook_url', '')
+                # Discord有効/無効トグル
+                env_enabled = os.environ.get('DISCORD_ENABLED')
+                if env_enabled is not None:
+                    config['discord_enabled'] = str(env_enabled).lower() in ['1','true','on','yes']
+                else:
+                    config['discord_enabled'] = config.get('discord_enabled', False)
                 config['discord_bot_token'] = os.environ.get('DISCORD_BOT_TOKEN') or config.get('discord_bot_token', '')
                 
                 # OANDA設定の環境変数読み込み
@@ -113,11 +120,10 @@ def validate_config(config):
     """設定ファイルのバリデーション（詳細版）"""
     errors = []
     
-    # 必須項目のチェック
-    required_fields = ['discord_webhook_url']
-    for field in required_fields:
-        if not config.get(field):
-            errors.append(f"必須項目 '{field}' が設定されていません")
+    # Discordは任意（有効時のみURL必須）
+    if config.get('discord_enabled'):
+        if not config.get('discord_webhook_url'):
+            errors.append("'discord_webhook_url' が設定されていません（Discord通知が有効です）")
     
     # 数値項目の範囲チェック
     numeric_ranges = {
@@ -271,6 +277,7 @@ if not validate_config(config):
 
 # 設定値の取得
 DISCORD_WEBHOOK_URL = config.get('discord_webhook_url')
+DISCORD_ENABLED = bool(config.get('discord_enabled', False))
 
 # OANDA設定
 OANDA_ACCOUNT_ID = config.get('oanda_account_id')
@@ -304,7 +311,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 # Discord Webhook初期化
 webhook = None
-if DISCORD_WEBHOOK_URL:
+if DISCORD_ENABLED and DISCORD_WEBHOOK_URL:
     try:
         webhook = SyncWebhook.from_url(DISCORD_WEBHOOK_URL)
     except Exception as e:
@@ -397,42 +404,83 @@ def close_position(symbol, position_id, size, side):
     else:
         oanda_symbol = symbol
     
-    data = {"longUnits": "ALL", "shortUnits": "ALL"}
+    # OANDAは片側のみ指定してクローズする必要がある
+    if str(side).upper() == "SELL":
+        # ロングポジションを閉じる
+        data = {"longUnits": "ALL"}
+    elif str(side).upper() == "BUY":
+        # ショートポジションを閉じる
+        data = {"shortUnits": "ALL"}
+    else:
+        # 不明時は現在のポジションから判定
+        try:
+            r_chk = positions.OpenPositions(OANDA_ACCOUNT_ID)
+            resp_chk = oanda_api.request(r_chk)
+            data = {"longUnits": "ALL"}
+            for p in resp_chk.get("positions", []):
+                if p.get("instrument") == oanda_symbol:
+                    long_units = float(p.get('long', {}).get('units', 0) or 0)
+                    short_units = float(p.get('short', {}).get('units', 0) or 0)
+                    data = {"longUnits": "ALL"} if long_units > 0 else {"shortUnits": "ALL"} if short_units > 0 else {"longUnits": "ALL"}
+                    break
+        except Exception:
+            data = {"longUnits": "ALL"}
+
     r = positions.PositionClose(OANDA_ACCOUNT_ID, instrument=oanda_symbol, data=data)
     resp = oanda_api.request(r)
     # price取得（なければNoneで返す）
     try:
-        price = float(resp["orderFillTransaction"]["price"])
+        if 'longOrderFillTransaction' in resp:
+            price = float(resp['longOrderFillTransaction'].get('price', 0))
+        elif 'shortOrderFillTransaction' in resp:
+            price = float(resp['shortOrderFillTransaction'].get('price', 0))
+        elif 'orderFillTransaction' in resp:
+            price = float(resp['orderFillTransaction'].get('price', 0))
+        else:
+            price = None
     except:
         price = None
     return {"data": {"price": price}}
 
 def check_current_positions(symbol):
-    # OANDAレート制限チェック
-    oanda_rate_limit()
-    
     # symbol表記をOANDA形式に変換（USDJPY → USD_JPY）
     if len(symbol) == 6 and not "_" in symbol:  # USDJPY形式
         oanda_symbol = f"{symbol[:3]}_{symbol[3:]}"
     else:
         oanda_symbol = symbol
     
-    r = positions.OpenPositions(OANDA_ACCOUNT_ID)
-    resp = oanda_api.request(r)
+    positions = broker.get_all_positions()
     out = []
-    for p in resp["positions"]:
-        if p["instrument"] == oanda_symbol:
-            for side in ["long", "short"]:
-                units = float(p[side]["units"])
-                if abs(units) > 0:
-                    out.append({
-                        "symbol": p["instrument"],
-                        "side": "BUY" if side == "long" else "SELL",
-                        "positionId": f"{p['instrument']}-{side}",
-                        "size": abs(units),
-                        "price": float(p[side]["averagePrice"])
-                    })
+    for p in positions:
+        if p.symbol == oanda_symbol:
+            out.append(p)
     return out
+
+# ===============================
+# ブローカー初期化
+# ===============================
+def initialize_broker():
+    """設定に基づきブローカーインスタンスを生成"""
+    broker_type = config.get('broker_type', 'oanda')
+    if broker_type == 'oanda':
+        broker_config = {
+            "name": "oanda",
+            "type": "oanda",
+            "trade_csv": os.getenv("TRADES_CSV", "trades.csv"),
+            "discord_webhook_url": config.get('discord_webhook_url', ''),
+            "oanda_account_id": config.get('oanda_account_id', ''),
+            "oanda_access_token": config.get('oanda_access_token', ''),
+            "oanda_environment": config.get('oanda_environment', 'practice'),
+            "leverage": config.get('leverage', 10),
+            "risk_ratio": config.get('risk_ratio', 1.0),
+            "autolot": config.get('autolot', 'TRUE'),
+            "symbol_daily_volume_limit": config.get('symbol_daily_volume_limit', 15000000)
+        }
+        broker = OANDABroker(broker_config)
+        if not broker.validate_config():
+            raise ValueError("OANDA設定が不完全です")
+        return broker
+    raise NotImplementedError(f"未対応ブローカー: {broker_type}")
 
 # ブローカーインスタンス作成
 try:
@@ -635,32 +683,32 @@ def cleanup_memory():
 
 def oanda_rate_limit():
     """OANDA APIレート制限管理（120回/分）"""
-    global oanda_rate_limit
+    global oanda_rate_limit_state
     now = time.time()
     
     # 1分間のウィンドウをチェック
-    if now - oanda_rate_limit['window_start'] >= 60:
-        oanda_rate_limit['request_count'] = 0
-        oanda_rate_limit['window_start'] = now
+    if now - oanda_rate_limit_state['window_start'] >= 60:
+        oanda_rate_limit_state['request_count'] = 0
+        oanda_rate_limit_state['window_start'] = now
     
     # レート制限チェック
-    if oanda_rate_limit['request_count'] >= oanda_rate_limit['max_requests_per_minute']:
-        wait_time = 60 - (now - oanda_rate_limit['window_start'])
+    if oanda_rate_limit_state['request_count'] >= oanda_rate_limit_state['max_requests_per_minute']:
+        wait_time = 60 - (now - oanda_rate_limit_state['window_start'])
         if wait_time > 0:
             logging.warning(f"OANDAレート制限により{wait_time:.1f}秒待機します")
             time.sleep(wait_time)
-        oanda_rate_limit['request_count'] = 0
-        oanda_rate_limit['window_start'] = time.time()
+        oanda_rate_limit_state['request_count'] = 0
+        oanda_rate_limit_state['window_start'] = time.time()
     
-    oanda_rate_limit['request_count'] += 1
-    oanda_rate_limit['last_request_time'] = now
+    oanda_rate_limit_state['request_count'] += 1
+    oanda_rate_limit_state['last_request_time'] = now
 
 def get_oanda_rate_limit_status():
     """OANDAレート制限の現在の状態を取得"""
     return {
-        'requests_this_minute': oanda_rate_limit['request_count'],
-        'max_requests_per_minute': oanda_rate_limit['max_requests_per_minute'],
-        'window_start': oanda_rate_limit['window_start']
+        'requests_this_minute': oanda_rate_limit_state['request_count'],
+        'max_requests_per_minute': oanda_rate_limit_state['max_requests_per_minute'],
+        'window_start': oanda_rate_limit_state['window_start']
     }
 
 # ===============================
@@ -720,7 +768,7 @@ def get_oanda_rate_limit_status():
 def send_discord_message(content):
     """Discordにメッセージを送信"""
     try:
-        if DISCORD_WEBHOOK_URL:
+        if DISCORD_ENABLED and DISCORD_WEBHOOK_URL:
             webhook = SyncWebhook.from_url(DISCORD_WEBHOOK_URL)
             webhook.send(content)
     except Exception as e:
@@ -962,16 +1010,16 @@ def calc_auto_lot_gmobot2(balance, symbol, side, leverage):
         logging.error(f"自動ロット計算エラー: {e}")
         raise
 
-def get_position_by_order_id(order_data):
+def get_position_by_order_id(order_data, symbol=None, side=None, expected_units=None):
     """
     新規注文のorderIdから建玉情報（positionId等）を取得（完全版）
     MAX_RETRIES: 最大リトライ回数
     RETRY_DELAY: リトライ間隔（秒）
     """
     MAX_RETRIES = 5
-    RETRY_DELAY = 3
+    RETRY_DELAY = 2
     position_id = None
-    execution_time = None
+    execution_time = datetime.now()
 
     try:
         # 入力データ検証（型チェック強化版）
@@ -986,107 +1034,56 @@ def get_position_by_order_id(order_data):
             send_discord_message("⚠️ ポジション取得エラー: 注文IDなし")
             return None
 
-        # 約定情報取得（リトライ機構付き）
-        execution_data = None
-        for _ in range(3):
-            try:
-                timestamp = generate_timestamp()
-                method = 'GET'
-                path = '/v1/executions'
-                url = 'https://forex-api.coin.z.com/private' + path
-                params = {"orderId": order_id}
-                headers = {
-                    "API-KEY": GMO_API_KEY,
-                    "API-TIMESTAMP": timestamp,
-                    "API-SIGN": generate_signature(timestamp, method, path)
-                }
-                
-                response = retry_request(method, url, headers, params=params)
-                if response and 'data' in response and 'list' in response['data']:
-                    execution_data = response['data']['list']
-                    break
-            except Exception as e:
-                logging.warning(f"約定情報取得リトライ中: {e}")
-                time.sleep(1)
+        # OANDA版: OpenPositionsから該当銘柄/方向のポジションを探す
+        # symbolのOANDA形式へ
+        target_symbol = symbol
+        if symbol and len(symbol) == 6 and '_' not in symbol:
+            target_symbol = f"{symbol[:3]}_{symbol[3:]}"
 
-        if not execution_data:
-            logging.error("約定情報取得に失敗")
-            send_discord_message("⚠️ ポジション取得エラー: 約定情報なし")
-            return None
-
-        # Position IDと約定時間抽出
-        for exec_data in execution_data:
-            if 'positionId' in exec_data:
-                position_id = exec_data['positionId']
-                execution_time = datetime.fromisoformat(
-                    exec_data.get('timestamp', datetime.now().isoformat()).replace('Z', '+00:00')
-                )
-                break
-                
-        if not position_id:
-            logging.error("Position IDが見つかりません")
-            send_discord_message("⚠️ ポジション取得エラー: Position IDなし")
-            return None
-
-        # ポジション情報取得（リトライ機構追加）
         for attempt in range(MAX_RETRIES):
             try:
-                timestamp = generate_timestamp()
-                method = 'GET'
-                path = '/v1/openPositions'
-                url = 'https://forex-api.coin.z.com/private' + path
-                headers = {
-                    "API-KEY": GMO_API_KEY,
-                    "API-TIMESTAMP": timestamp,
-                    "API-SIGN": generate_signature(timestamp, method, path)
-                }
-                
-                pos_response = retry_request(method, url, headers)
-                if not pos_response or 'data' not in pos_response or 'list' not in pos_response['data']:
-                    continue
+                oanda_rate_limit()
+                r = positions.OpenPositions(OANDA_ACCOUNT_ID)
+                resp = oanda_api.request(r)
+                if 'positions' in resp:
+                    for pos in resp['positions']:
+                        if target_symbol and pos.get('instrument') != target_symbol:
+                            continue
+                        long_units = float(pos.get('long', {}).get('units', 0) or 0)
+                        short_units = float(pos.get('short', {}).get('units', 0) or 0)
 
-                # 該当ポジション検索
-                for pos in pos_response['data']['list']:
-                    if pos.get('positionId') == position_id:
-                        # タイムスタンプ処理（フォーマット統一）
-                        open_time = pos.get('openTime')
-                        if open_time and execution_time:
-                            try:
-                                # タイムスタンプのフォーマット処理を改善
-                                if 'T' in open_time:
-                                    # ISO形式の場合
-                                    open_time = datetime.fromisoformat(open_time.replace('Z', '+00:00')).isoformat(timespec='milliseconds') + 'Z'
-                                else:
-                                    # その他の形式の場合
-                                    open_time = execution_time.isoformat(timespec='milliseconds') + 'Z'
-                            except Exception as e:
-                                logging.warning(f"タイムスタンプ変換エラー: {e}")
-                                open_time = execution_time.isoformat(timespec='milliseconds') + 'Z'
-                        else:
-                            open_time = execution_time.isoformat(timespec='milliseconds') + 'Z' if execution_time else datetime.now().isoformat(timespec='milliseconds') + 'Z'
+                        # 候補を組み立て
+                        candidates = []
+                        if long_units > 0:
+                            candidates.append(('BUY', long_units, float(pos.get('long', {}).get('averagePrice', 0) or 0), 'long'))
+                        if short_units > 0:
+                            candidates.append(('SELL', short_units, float(pos.get('short', {}).get('averagePrice', 0) or 0), 'short'))
 
-                        return {
-                            'positionId': position_id,
-                            'symbol': pos.get('symbol'),
-                            'side': pos.get('side'),
-                            'price': float(pos.get('price', 0)),
-                            'size': float(pos.get('size', 0)),
-                            'openTime': open_time,
-                            'entry_time': execution_time.strftime('%H:%M:%S') if execution_time else datetime.now().strftime('%H:%M:%S')
-                        }
+                        # 方向マッチ優先
+                        for cand_side, units, price, side_key in candidates:
+                            if side and cand_side != side:
+                                continue
+                            # 期待数量があれば近いものを優先
+                            if expected_units is not None and abs(units) + 1e-9 < float(expected_units):
+                                continue
 
-                # ポジションが見つからない場合リトライ
+                            position_id = f"{pos.instrument}-{side_key}"
+                            open_time = execution_time.isoformat(timespec='milliseconds') + 'Z'
+                            return {
+                                'positionId': position_id,
+                                'symbol': pos.instrument,
+                                'side': cand_side,
+                                'price': price,
+                                'size': float(units),
+                                'openTime': open_time,
+                                'entry_time': execution_time.strftime('%H:%M:%S')
+                            }
                 time.sleep(RETRY_DELAY)
-                
-            except KeyError as e:
-                logging.warning(f"APIレスポンスキーエラー: {e}")
-                time.sleep(RETRY_DELAY)
-            except requests.exceptions.RequestException as e:
-                logging.warning(f"リクエストエラー: {e}")
+            except Exception as e:
+                logging.warning(f"OANDAポジション取得リトライ中: {e}")
                 time.sleep(RETRY_DELAY)
 
-        logging.error(f"{MAX_RETRIES}回リトライ後もポジションを検出できず")
-        send_discord_message(f"⚠️ 警告: {MAX_RETRIES}回リトライ後もポジション未検出")
+        logging.error(f"{MAX_RETRIES}回リトライ後もOANDAポジションを検出できず")
         return None
 
     except Exception as e:
@@ -1262,7 +1259,10 @@ def process_trades(trades):
                     
                     # 建玉情報取得
                     if 'data' in response_order and response_order['data']:
-                        position_info = get_position_by_order_id(response_order['data'])
+                        position_info = get_position_by_order_id(
+                            response_order['data'], symbol=pair, side=side,
+                            expected_units=actual_size if 'actual_size' in locals() else None
+                        )
                     else:
                         logging.error(f"APIレスポンスに'data'がありません: {response_order}")
                         send_discord_message(f"エントリー注文エラー: APIレスポンスに'data'がありません: {response_order}")
@@ -1362,9 +1362,9 @@ def process_trades(trades):
                                 send_discord_message(f"⚠️ 決済処理が最大試行回数を超えました: {position['symbol']} {position['side']}")
                                 # 最終的に手動決済を試行
                                 try:
-                                    exit_side = "SELL" if position['side'] == "BUY" else "BUY"
-                                    close_position(position['symbol'], position['positionId'], position['size'], exit_side)
-                                    send_discord_message(f"⚠️ 手動決済を実行しました: {position['symbol']} {position['side']}")
+                                    exit_side = "SELL" if position.side == "BUY" else "BUY"
+                                    broker.close_position(position.symbol, position.position_id, position.size, exit_side)
+                                    send_discord_message(f"⚠️ 手動決済を実行しました: {position.symbol} {position.side}")
                                     positions_to_monitor.remove(position)
                                 except Exception as final_e:
                                     logging.error(f"手動決済も失敗: {final_e}\n{traceback.format_exc()}")
@@ -1425,7 +1425,7 @@ def enter_trade(trade_data):
         # 重複建玉防止チェック
         positions = check_current_positions(pair)
         for pos in positions:
-            if pos['side'] == side:
+            if pos.side == side:
                 logging.warning(f"重複建玉検出: {pair} {side} 既存建玉あり。再注文をスキップします。")
                 send_discord_message(f"重複建玉検出: {pair} {side} 既存建玉あり。再注文をスキップします。")
                 return True  # 重複建玉がある場合は成功として扱う
@@ -1497,7 +1497,10 @@ def enter_trade(trade_data):
             return False
         
         # ポジション情報取得
-        position_info = get_position_by_order_id(response_order['data'])
+        position_info = get_position_by_order_id(
+            response_order['data'], symbol=pair, side=side,
+            expected_units=actual_size if 'actual_size' in locals() else None
+        )
         if position_info:
             # エントリー成功通知
             entry_price = position_info['price']
@@ -1552,14 +1555,14 @@ def exit_trade(trade_data):
         # 各ポジションを決済
         for position in positions:
             try:
-                position_id = position.get('positionId')
-                size = position.get('size')
-                side = position.get('side')
+                position_id = getattr(position, 'position_id', None)
+                size = getattr(position, 'size', None)
+                side = getattr(position, 'side', None)
                 
                 if position_id and size and side:
                     logging.info(f"決済実行: {pair} {side} size={size}")
                     
-                    response = close_position(pair, position_id, size, side)
+                    response = broker.close_position(pair, position_id, size, side)
                     if response and 'data' in response:
                         # 決済成功通知
                         exit_price = response['data'].get('price', 'N/A')
@@ -1657,6 +1660,38 @@ def main_loop(schedule: TradeSchedule):
                         if exit_trade(trade):
                             metrics.exit_count += 1
                             metrics.last_exit = current_time
+                        else:
+                            # フォールバック: 取引対象シンボルの残存ポジションを強制決済
+                            try:
+                                positions = broker.get_all_positions()
+                                target_symbol = trade.symbol.replace('/', '_')
+                                for pos in positions:
+                                    if pos.symbol == target_symbol:
+                                        exit_side = 'SELL' if pos.side == 'BUY' else 'BUY'
+                                        broker.close_position(pos.symbol, pos.position_id, pos.size, exit_side)
+                                        logger.info(f"フォールバック決済実行: {pos.symbol} {pos.side} size={pos.size}")
+                                        metrics.exit_count += 1
+                                        metrics.last_exit = current_time
+                            except Exception as e:
+                                logger.error(f"フォールバック決済エラー: {e}")
+                else:
+                    # アクティブ取引が検出できない場合のフォールバック: 今日の銘柄で残存ポジションをクローズ
+                    try:
+                        today_trades = schedule.get_trades_for_today()
+                        symbols = set()
+                        for t in today_trades:
+                            s = t.symbol.replace('/', '_') if '/' in t.symbol else (f"{t.symbol[:3]}_{t.symbol[3:]}" if len(t.symbol) == 6 and '_' not in t.symbol else t.symbol)
+                            symbols.add(s)
+                        positions = broker.get_all_positions()
+                        for pos in positions:
+                            if pos.symbol in symbols:
+                                exit_side = 'SELL' if pos.side == 'BUY' else 'BUY'
+                                broker.close_position(pos.symbol, pos.position_id, pos.size, exit_side)
+                                logger.info(f"フォールバック決済実行(アクティブなし): {pos.symbol} {pos.side} size={pos.size}")
+                                metrics.exit_count += 1
+                                metrics.last_exit = current_time
+                    except Exception as e:
+                        logger.error(f"フォールバック決済エラー(アクティブなし): {e}")
             
             # 定期的にメトリクスをログ出力
             if (metrics.entry_count + metrics.exit_count) % 10 == 0:
@@ -1708,7 +1743,7 @@ if DISCORD_BOT_TOKEN:
         await ctx.send('🚨 全通貨ペアの全ポジション決済を実行します...')
         logging.warning(f"Discord Bot: 全ポジション決済コマンド実行 by {ctx.author}")
         try:
-            positions = get_all_positions()
+            positions = broker.get_all_positions()
             if not positions:
                 await ctx.send('✅ 現在ポジションはありません。')
                 return
@@ -1721,15 +1756,15 @@ if DISCORD_BOT_TOKEN:
                         closed.append(f"❌ 無効なポジション情報: {pos}")
                         error_count += 1
                         continue
-                    exit_side = 'SELL' if pos['side'] == 'BUY' else 'BUY'
-                    entry_price = float(pos['price'])
-                    size = float(pos['size'])
-                    symbol = pos['symbol']
-                    executed_price = close_position(symbol, pos['positionId'], size, exit_side)
-                    profit_pips = calculate_profit_pips(entry_price, executed_price, pos['side'], symbol)
-                    profit_amount = calculate_profit_amount(entry_price, executed_price, pos['side'], symbol, size)
+                    exit_side = 'SELL' if pos.side == 'BUY' else 'BUY'
+                    entry_price = float(pos.price)
+                    size = float(pos.size)
+                    symbol = pos.symbol
+                    executed_price = broker.close_position(symbol, pos.position_id, size, exit_side)
+                    profit_pips = calculate_profit_pips(entry_price, executed_price, pos.side, symbol)
+                    profit_amount = calculate_profit_amount(entry_price, executed_price, pos.side, symbol, size)
                     closed.append(
-                        f"✅ {symbol} {pos['side']} {size}lot 決済\n"
+                        f"✅ {symbol} {pos.side} {size}lot 決済\n"
                         f"エントリー価格: {entry_price}\n"
                         f"決済価格: {executed_price}\n"
                         f"損益: {profit_pips}pips ({profit_amount}円)"
@@ -1737,15 +1772,15 @@ if DISCORD_BOT_TOKEN:
                     # trade_resultsに追加
                     trade_results.append({
                         "symbol": symbol,
-                        "side": pos['side'],
+                        "side": pos.side,
                         "entry_price": entry_price,
                         "exit_price": executed_price,
                         "profit_pips": profit_pips,
                         "profit_amount": profit_amount,
                         "lot_size": size,
-                        "entry_time": pos.get('openTime', ''),
+                        "entry_time": getattr(pos, 'openTime', ''),
                         "exit_time": datetime.now().strftime('%H:%M:%S'),
-                        "entry_date": pos.get('entry_date', datetime.now().date()),
+                        "entry_date": getattr(pos, 'entry_date', datetime.now().date()),
                         "exit_date": datetime.now().date(),
                     })
                     success_count += 1
@@ -1768,7 +1803,7 @@ if DISCORD_BOT_TOKEN:
             else:
                 remaining_msg = '⚠️ 残存ポジション:\n'
                 for pos in positions_after:
-                    remaining_msg += f"{pos['symbol']} {pos['side']} {pos['size']}\n"
+                    remaining_msg += f"{pos.symbol} {pos.side} {pos.size}\n"
                 await ctx.send(remaining_msg)
         except Exception as e:
             error_msg = f'❌ 全ポジション決済中にエラーが発生しました: {e}'
@@ -1790,8 +1825,8 @@ if DISCORD_BOT_TOKEN:
                 await ctx.send('⚠️ 残存ポジションを決済してから停止します...')
                 for pos in positions:
                     try:
-                        exit_side = 'SELL' if pos['side'] == 'BUY' else 'BUY'
-                        close_position(pos['symbol'], pos['positionId'], pos['size'], exit_side)
+                        exit_side = 'SELL' if pos.side == 'BUY' else 'BUY'
+                        broker.close_position(pos.symbol, pos.position_id, pos.size, exit_side)
                     except Exception as e:
                         logging.error(f"停止時のポジション決済エラー: {e}")
             await ctx.send('✅ ボットを停止しました。')
@@ -1841,34 +1876,34 @@ if DISCORD_BOT_TOKEN:
             for pos in positions:
                 try:
                     # 現在価格を取得
-                    tickers = get_tickers([pos['symbol']])
+                    tickers = broker.get_tickers([pos.symbol])
                     current_price = None
                     if tickers and 'data' in tickers:
                         for item in tickers['data']:
-                            if item['symbol'] == pos['symbol']:
+                            if item['symbol'] == pos.symbol:
                                 current_price = item
                                 break
                     
                     if current_price:
                         # 含み損益を計算
-                        if pos['side'] == 'BUY':
-                            profit_pips = calculate_current_profit_pips(float(pos['price']), current_price, 'BUY', pos['symbol'])
+                        if pos.side == 'BUY':
+                            profit_pips = calculate_current_profit_pips(float(pos.price), current_price, 'BUY', pos.symbol)
                         else:
-                            profit_pips = calculate_current_profit_pips(float(pos['price']), current_price, 'SELL', pos['symbol'])
+                            profit_pips = calculate_current_profit_pips(float(pos.price), current_price, 'SELL', pos.symbol)
                         
-                        profit_amount = calculate_profit_amount(float(pos['price']), 
-                                                              float(current_price['bid']) if pos['side'] == 'BUY' else float(current_price['ask']), 
-                                                              pos['side'], pos['symbol'], pos['size'])
+                        profit_amount = calculate_profit_amount(float(pos.price), 
+                                                              float(current_price['bid']) if pos.side == 'BUY' else float(current_price['ask']), 
+                                                              pos.side, pos.symbol, pos.size)
                         
-                        position_msg += (f"**{pos['symbol']}** {pos['side']} {pos['size']}lot\n"
-                                       f"エントリー: {pos['price']} | 現在: {current_price['bid']}/{current_price['ask']}\n"
+                        position_msg += (f"**{pos.symbol}** {pos.side} {pos.size}lot\n"
+                                       f"エントリー: {pos.price} | 現在: {current_price['bid']}/{current_price['ask']}\n"
                                        f"損益: {profit_pips}pips ({profit_amount}円)\n\n")
                         total_pnl += profit_amount
                     else:
-                        position_msg += f"**{pos['symbol']}** {pos['side']} {pos['size']}lot (価格取得失敗)\n\n"
+                        position_msg += f"**{pos.symbol}** {pos.side} {pos.size}lot (価格取得失敗)\n\n"
                         
                 except Exception as e:
-                    position_msg += f"**{pos['symbol']}** エラー: {e}\n\n"
+                    position_msg += f"**{pos.symbol}** エラー: {e}\n\n"
             
             position_msg += f"**合計損益: {total_pnl:.2f}円**"
             
@@ -2094,7 +2129,7 @@ if DISCORD_BOT_TOKEN:
             all_msg += "📊 **現在のポジション**\n"
             if positions:
                 for pos in positions:
-                    all_msg += f"{pos['symbol']} {pos['side']} {pos['size']}lot\n"
+                    all_msg += f"{pos.symbol} {pos.side} {pos.size}lot\n"
             else:
                 all_msg += "ポジションなし\n"
             all_msg += "\n"
@@ -2124,7 +2159,7 @@ if DISCORD_BOT_TOKEN:
             await ctx.send(f'🧮 {symbol} {side} のロット計算テストを実行中...')
             
             # 残高取得
-            balance_data = get_fx_balance()
+            balance_data = broker.get_balance()
             if not balance_data or 'data' not in balance_data:
                 await ctx.send('❌ 残高取得に失敗しました。')
                 return
@@ -2276,33 +2311,33 @@ def close_position_by_info(position, exit_time, auto_closed=False, trade_index=N
     ポジション情報から決済注文を発行し、損益を記録・通知
     """
     global trade_results, total_api_fee
-    exit_side = "SELL" if position['side'] == "BUY" else "BUY"
+    exit_side = "SELL" if position.side == "BUY" else "BUY"
     # 決済時jitterのsleepはprocess_trades側で行うため、ここでは不要
-    average_exit_price = close_position(
-        position['symbol'], position['positionId'], position['size'], exit_side
+    average_exit_price = broker.close_position(
+        position.symbol, position.position_id, position.size, exit_side
     )
     profit_pips = calculate_profit_pips(
-        float(position['price']), average_exit_price, position['side'], position['symbol']
+        float(position.price), average_exit_price, position.side, position.symbol
     )
     profit_amount = calculate_profit_amount(
-        float(position['price']), average_exit_price, position['side'], position['symbol'], position['size']
+        float(position.price), average_exit_price, position.side, position.symbol, position.size
     )
     trade_results.append({
-        "symbol": position['symbol'],
-        "side": position['side'],
-        "entry_price": float(position['price']),
+        "symbol": position.symbol,
+        "side": position.side,
+        "entry_price": float(position.price),
         "exit_price": average_exit_price,
         "profit_pips": profit_pips,
         "profit_amount": profit_amount,
-        "lot_size": position['size'],
-        "entry_time": position.get('entry_time', datetime.now().strftime('%H:%M:%S')),
+        "lot_size": position.size,
+        "entry_time": getattr(position, 'entry_time', datetime.now().strftime('%H:%M:%S')),
         "exit_time": datetime.now().strftime('%H:%M:%S'),
-        "entry_date": position.get('entry_date', datetime.now().date()),
+        "entry_date": getattr(position, 'entry_date', datetime.now().date()),
         "exit_date": datetime.now().date(),
     })
     close_type = "自動決済" if auto_closed else "予定決済"
     # 証拠金残高取得
-    balance_data = get_fx_balance()
+    balance_data = broker.get_balance()
     data = balance_data.get('data')
     if isinstance(data, list) and len(data) > 0:
         balance_amount = float(data[0].get('balance', 0))
@@ -2311,12 +2346,12 @@ def close_position_by_info(position, exit_time, auto_closed=False, trade_index=N
     else:
         balance_amount = 0
     send_discord_message(
-        f"{close_type}しました: 通貨ペア={position['symbol']}, 売買方向={position['side']}, "
-        f"エントリー価格={position['price']}, 決済価格={average_exit_price}, 損益pips={profit_pips} ({profit_amount}円), ロット数={position['size']} "
+        f"{close_type}しました: 通貨ペア={position.symbol}, 売買方向={position.side}, "
+        f"エントリー価格={position.price}, 決済価格={average_exit_price}, 損益pips={profit_pips} ({profit_amount}円), ロット数={position.size} "
         f"(決済時間: {datetime.now().strftime('%H:%M:%S')})\n"
         f"現在の証拠金残高: {balance_amount}円"
     )
-    print(f"【決済完了】{close_type}: {position['symbol']} {position['side']} {position['price']}→{average_exit_price} {profit_pips}pips ({profit_amount}円) ロット数:{position['size']}")
+    print(f"【決済完了】{close_type}: {position.symbol} {position.side} {position.price}→{average_exit_price} {profit_pips}pips ({profit_amount}円) ロット数:{position.size}")
     return profit_pips
 
 def schedule_position_check(symbol, expected_close_time):
@@ -2329,10 +2364,10 @@ def schedule_position_check(symbol, expected_close_time):
         if positions:
             logging.warning(f"未認識のポジションが見つかりました。決済を実行します: {positions}")
             for position in positions:
-                exit_side = "SELL" if position['side'] == "BUY" else "BUY"
+                exit_side = "SELL" if position.side == "BUY" else "BUY"
                 try:
-                    close_position(position['symbol'], position['positionId'], position['size'], exit_side)
-                    send_discord_message(f"⚠️ 未認識ポジションを検出し決済しました: {position['symbol']} {position['side']}")
+                    broker.close_position(position.symbol, position.position_id, position.size, exit_side)
+                    send_discord_message(f"⚠️ 未認識ポジションを検出し決済しました: {position.symbol} {position.side}")
                 except Exception as e:
                     logging.error(f"未認識ポジション決済中のエラー: {e}")
             return True
@@ -2354,7 +2389,7 @@ def health_check():
         
         # API接続チェック
         try:
-            balance_data = get_fx_balance()
+            balance_data = broker.get_balance()
             if balance_data and 'data' in balance_data:
                 health_status['api_connection'] = True
                 logging.info("API接続: 正常")
@@ -2462,7 +2497,7 @@ def get_system_status():
         today_pnl = sum([t.get('profit_amount', 0) for t in trade_results if t.get('exit_date') == datetime.now().date()])
         
         # レート制限状態
-        rate_limit_status = get_rate_limit_status()
+        rate_limit_status = get_oanda_rate_limit_status()
         
         # ヘルスチェック
         health_status = health_check()
@@ -2474,8 +2509,8 @@ def get_system_status():
             'disk_free_gb': disk_free_gb,
             'api_calls': performance_metrics['api_calls'],
             'api_errors': performance_metrics['api_errors'],
-            'rate_limit': rate_limit_status['current_limit'],
-            'rate_limit_errors': rate_limit_status['error_count'],
+            'rate_limit': rate_limit_status.get('max_requests_per_minute'),
+            'rate_limit_errors': performance_metrics['api_errors'],
             'today_trades': today_trades,
             'today_pnl': today_pnl,
             'total_api_fee': total_api_fee,
@@ -2647,7 +2682,7 @@ def test_auto_lot_debug():
         debug_info = {}
         
         # 残高取得
-        balance_data = get_fx_balance()
+        balance_data = broker.get_balance()
         if balance_data and 'data' in balance_data:
             balance = float(balance_data['data'][0]['balance'])
             debug_info['balance'] = balance
@@ -2799,7 +2834,7 @@ def force_kill_all_positions_and_notify():
     """
     全ポジションを強制決済し、損益情報をdiscord通知
     """
-    positions = get_all_positions()
+    positions = broker.get_all_positions()
     if not positions:
         return
     total_pips = 0
@@ -2807,12 +2842,12 @@ def force_kill_all_positions_and_notify():
     msg = "🚨 強制決済（kill）を実行しました\n"
     for pos in positions:
         try:
-            entry_price = float(pos.get('price'))
-            size = float(pos.get('size'))
-            symbol = pos.get('symbol')
-            side = pos.get('side')
+            entry_price = float(pos.price)
+            size = float(pos.size)
+            symbol = pos.symbol
+            side = pos.side
             # 現在価格取得
-            tickers = get_tickers([symbol])
+            tickers = broker.get_tickers([symbol])
             if not tickers or 'data' not in tickers:
                 continue
             rate_data = None
@@ -2830,7 +2865,7 @@ def force_kill_all_positions_and_notify():
             total_amount += profit_amount
             # 決済
             exit_side = 'SELL' if side == 'BUY' else 'BUY'
-            close_position(symbol, pos['positionId'], size, exit_side)
+            broker.close_position(symbol, pos.position_id, size, exit_side)
             msg += f"{symbol} {side} {size}lot: {profit_pips:.1f}pips, {profit_amount:.0f}円\n"
         except Exception as e:
             logging.error(f"強制決済エラー: {e}")
@@ -2847,7 +2882,7 @@ def periodic_position_check():
             try:
                 now = datetime.now()
                 schedule = load_trades_schedule()
-                positions = get_all_positions()
+                positions = broker.get_all_positions()
                 
                 # エントリー時間または決済時間の前後5秒以内の場合は監視をスキップ
                 if is_near_schedule_time(now, schedule, buffer_seconds=5):
@@ -2875,10 +2910,10 @@ def monitor_and_close_positions(positions_to_monitor):
     
     try:
         # 監視対象の通貨ペアを重複排除して取得
-        symbols = list(set(pos['symbol'] for pos in positions_to_monitor))
+        symbols = list(set(pos.symbol for pos in positions_to_monitor))
         
         # 最新のティッカー情報を一括取得
-        tickers_data = get_tickers(symbols)
+        tickers_data = broker.get_tickers(symbols)
         
         if not tickers_data or 'data' not in tickers_data:
             logging.error("ティッカー情報の取得に失敗しました")
@@ -2899,14 +2934,14 @@ def monitor_and_close_positions(positions_to_monitor):
         # ポジションごとに損益計算と決済判定
         positions_to_remove = []  # 削除対象を記録
         for position in positions_to_monitor:
-            symbol = position['symbol']
+            symbol = position.symbol
             if symbol not in current_prices:
                 continue
             
             try:
                 # ポジション情報の型変換を強化
-                entry_price = float(position['price'])
-                side = position['side']
+                entry_price = float(position.price)
+                side = position.side
                 current_price = current_prices[symbol]
                 
                 # 含み損益計算
@@ -2957,33 +2992,33 @@ def close_position_by_info(position, exit_time, auto_closed=False, trade_index=N
     ポジション情報から決済注文を発行し、損益を記録・通知
     """
     global trade_results, total_api_fee
-    exit_side = "SELL" if position['side'] == "BUY" else "BUY"
+    exit_side = "SELL" if position.side == "BUY" else "BUY"
     # 決済時jitterのsleepはprocess_trades側で行うため、ここでは不要
-    average_exit_price = close_position(
-        position['symbol'], position['positionId'], position['size'], exit_side
+    average_exit_price = broker.close_position(
+        position.symbol, position.position_id, position.size, exit_side
     )
     profit_pips = calculate_profit_pips(
-        float(position['price']), average_exit_price, position['side'], position['symbol']
+        float(position.price), average_exit_price, position.side, position.symbol
     )
     profit_amount = calculate_profit_amount(
-        float(position['price']), average_exit_price, position['side'], position['symbol'], position['size']
+        float(position.price), average_exit_price, position.side, position.symbol, position.size
     )
     trade_results.append({
-        "symbol": position['symbol'],
-        "side": position['side'],
-        "entry_price": float(position['price']),
+        "symbol": position.symbol,
+        "side": position.side,
+        "entry_price": float(position.price),
         "exit_price": average_exit_price,
         "profit_pips": profit_pips,
         "profit_amount": profit_amount,
-        "lot_size": position['size'],
-        "entry_time": position.get('entry_time', datetime.now().strftime('%H:%M:%S')),
+        "lot_size": position.size,
+        "entry_time": getattr(position, 'entry_time', datetime.now().strftime('%H:%M:%S')),
         "exit_time": datetime.now().strftime('%H:%M:%S'),
-        "entry_date": position.get('entry_date', datetime.now().date()),
+        "entry_date": getattr(position, 'entry_date', datetime.now().date()),
         "exit_date": datetime.now().date(),
     })
     close_type = "自動決済" if auto_closed else "予定決済"
     # 証拠金残高取得
-    balance_data = get_fx_balance()
+    balance_data = broker.get_balance()
     data = balance_data.get('data')
     if isinstance(data, list) and len(data) > 0:
         balance_amount = float(data[0].get('balance', 0))
@@ -2992,12 +3027,12 @@ def close_position_by_info(position, exit_time, auto_closed=False, trade_index=N
     else:
         balance_amount = 0
     send_discord_message(
-        f"{close_type}しました: 通貨ペア={position['symbol']}, 売買方向={position['side']}, "
-        f"エントリー価格={position['price']}, 決済価格={average_exit_price}, 損益pips={profit_pips} ({profit_amount}円), ロット数={position['size']} "
+        f"{close_type}しました: 通貨ペア={position.symbol}, 売買方向={position.side}, "
+        f"エントリー価格={position.price}, 決済価格={average_exit_price}, 損益pips={profit_pips} ({profit_amount}円), ロット数={position.size} "
         f"(決済時間: {datetime.now().strftime('%H:%M:%S')})\n"
         f"現在の証拠金残高: {balance_amount}円"
     )
-    print(f"【決済完了】{close_type}: {position['symbol']} {position['side']} {position['price']}→{average_exit_price} {profit_pips}pips ({profit_amount}円) ロット数:{position['size']}")
+    print(f"【決済完了】{close_type}: {position.symbol} {position.side} {position.price}→{average_exit_price} {profit_pips}pips ({profit_amount}円) ロット数:{position.size}")
     return profit_pips
 
 def schedule_position_check(symbol, expected_close_time):
@@ -3010,10 +3045,10 @@ def schedule_position_check(symbol, expected_close_time):
         if positions:
             logging.warning(f"未認識のポジションが見つかりました。決済を実行します: {positions}")
             for position in positions:
-                exit_side = "SELL" if position['side'] == "BUY" else "BUY"
+                exit_side = "SELL" if position.side == "BUY" else "BUY"
                 try:
-                    close_position(position['symbol'], position['positionId'], position['size'], exit_side)
-                    send_discord_message(f"⚠️ 未認識ポジションを検出し決済しました: {position['symbol']} {position['side']}")
+                    broker.close_position(position.symbol, position.position_id, position.size, exit_side)
+                    send_discord_message(f"⚠️ 未認識ポジションを検出し決済しました: {position.symbol} {position.side}")
                 except Exception as e:
                     logging.error(f"未認識ポジション決済中のエラー: {e}")
             return True
@@ -3426,7 +3461,7 @@ def finalize_trades_for_day(target_date):
     
     # 口座残高取得（例外処理追加）
     try:
-        balance_data = get_fx_balance()
+        balance_data = broker.get_balance()
         data = balance_data.get('data')
         if isinstance(data, list) and len(data) > 0:
             balance_amount = float(data[0].get('balance', 0))
@@ -3643,7 +3678,7 @@ def execute_daily_trades():
 
         # 口座残高を取得
         try:
-            balance_data = get_fx_balance()
+            balance_data = broker.get_balance()
             data = balance_data.get('data')
             if isinstance(data, list) and len(data) > 0:
                 balance_amount = float(data[0].get('balance', 0))

@@ -169,35 +169,51 @@ class TradeSchedule:
     def should_enter(self) -> bool:
         """エントリー条件をチェック"""
         now = self.now()
-        today_trades = self.get_trades_for_today()
         
-        for trade in today_trades:
+        for trade in self._trades:
+            # エントリー時刻を今日の日付でdatetimeに変換
             entry_dt = datetime.combine(now.date(), trade.entry_time, now.tzinfo)
+            
+            # 現在時刻より前の場合は翌日に調整（ただし、今日の取引がまだ実行されていない場合のみ）
             if entry_dt < now:
-                entry_dt += timedelta(days=1)
+                # 今日の取引が既に実行されているかチェック
+                today_key = f"{now.date()}_{trade.trade_number}"
+                if today_key not in self._executed_trades:
+                    entry_dt += timedelta(days=1)
             
             # バッファ時間内かチェック
             time_diff = abs((now - entry_dt).total_seconds())
+            print(f"DEBUG: should_enter - now={now}, entry_dt={entry_dt}, time_diff={time_diff}")
             if time_diff <= 5:  # 5秒のバッファ
+                print(f"DEBUG: should_enter - TRUE for trade {trade.trade_number}")
                 return True
         
+        print(f"DEBUG: should_enter - FALSE")
         return False
 
     def should_exit(self) -> bool:
         """決済条件をチェック"""
         now = self.now()
-        today_trades = self.get_trades_for_today()
         
-        for trade in today_trades:
+        for trade in self._trades:
+            # 決済時刻を今日の日付でdatetimeに変換
             exit_dt = datetime.combine(now.date(), trade.exit_time, now.tzinfo)
+            
+            # 現在時刻より前の場合は翌日に調整（ただし、今日の取引がまだ実行されていない場合のみ）
             if exit_dt < now:
-                exit_dt += timedelta(days=1)
+                # 今日の取引が既に実行されているかチェック
+                today_key = f"{now.date()}_{trade.trade_number}"
+                if today_key not in self._executed_trades:
+                    exit_dt += timedelta(days=1)
             
             # バッファ時間内かチェック
             time_diff = abs((now - exit_dt).total_seconds())
+            print(f"DEBUG: should_exit - now={now}, exit_dt={exit_dt}, time_diff={time_diff}")
             if time_diff <= 5:  # 5秒のバッファ
+                print(f"DEBUG: should_exit - TRUE for trade {trade.trade_number}")
                 return True
         
+        print(f"DEBUG: should_exit - FALSE")
         return False
 
     def get_next_trade(self) -> Optional[TradeData]:
