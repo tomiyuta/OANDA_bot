@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-GMO Coin Automated Trading Bot (Integrated Version)
-Version: 2.1.0
+OANDA REST API v20 Automated Trading Bot (Integrated Version)
+Version: 3.0.0
 License: MIT License
-Copyright (c) 2024 GMO Coin Bot
+Copyright (c) 2024 OANDA Trading Bot
 
-A sophisticated automated trading system for GMO Coin cryptocurrency exchange.
+A sophisticated automated trading system for OANDA trading platform.
 Features include risk management, Discord integration, and GUI configuration.
 Integrated with robust time handling and dependency injection.
 
@@ -37,8 +37,6 @@ import gc
 from trading_time import TradeSchedule, SystemClock, JST
 
 # OANDA APIインポート
-import oandapyV20
-from oandapyV20.endpoints import accounts, orders, pricing, positions
 from oanda_broker import OANDABroker
 
 # ===============================
@@ -61,6 +59,9 @@ oanda_rate_limit_state = {
     'window_start': time.time(),
     'max_requests_per_minute': 120
 }
+
+# OANDAブローカーインスタンス
+oanda_broker = None
 
 # 設定ファイル管理
 CONFIG_FILE = os.environ.get('CONFIG_FILE', 'config.json')
@@ -85,7 +86,7 @@ def load_config():
                 config = json.load(f)
                 
                 # 環境変数からの設定読み込み（優先度: 環境変数 > 設定ファイル）
-                config['discord_webhook_url'] = os.environ.get('DISCORD_WEBHOOK_GMO') or config.get('discord_webhook_url', '')
+                config['discord_webhook_url'] = os.environ.get('DISCORD_WEBHOOK_URL') or config.get('discord_webhook_url', '')
                 # Discord有効/無効トグル
                 env_enabled = os.environ.get('DISCORD_ENABLED')
                 if env_enabled is not None:
@@ -93,11 +94,17 @@ def load_config():
                 else:
                     config['discord_enabled'] = config.get('discord_enabled', False)
                 config['discord_bot_token'] = os.environ.get('DISCORD_BOT_TOKEN') or config.get('discord_bot_token', '')
-                
+
                 # OANDA設定の環境変数読み込み
                 config['oanda_account_id'] = os.environ.get('OANDA_ACCOUNT_ID') or config.get('oanda_account_id', '')
                 config['oanda_access_token'] = os.environ.get('OANDA_ACCESS_TOKEN') or config.get('oanda_access_token', '')
                 config['oanda_environment'] = os.environ.get('OANDA_ENVIRONMENT') or config.get('oanda_environment', 'practice')
+
+                # ブローカー設定を正規化（OANDAのみ）
+                if 'brokers' in config and len(config['brokers']) > 0:
+                    # 最初のブローカーをメイン設定として使用
+                    broker_config = config['brokers'][0].copy()
+                    config.update(broker_config)
                 config['broker_type'] = os.environ.get('BROKER_TYPE') or config.get('broker_type', 'oanda')
                 
                 return config
